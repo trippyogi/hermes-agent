@@ -192,3 +192,64 @@ class TestBusySessionAuthBypass:
         running_agent.steer.assert_not_called()
         # Nothing queued
         assert sk not in adapter._pending_messages
+
+    @pytest.mark.asyncio
+    async def test_busy_hook_runs_before_authorization(self, monkeypatch):
+        """A plugin can authorize a busy sender before the auth gate runs."""
+        from gateway.run import GatewayRunner
+
+        runner, _sentinel = _make_runner(authorized_users={"plugin-authorized"})
+        runner._busy_input_mode = "queue"
+        adapter = _make_adapter()
+        event = _make_event(text="follow up", user_id="untrusted")
+        session_key = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+        monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
+
+        seen = []
+
+        def _hook(name, **kwargs):
+            assert name == "pre_gateway_dispatch"
+            seen.append(kwargs["event"].source.user_id)
+            kwargs["event"].source.user_id = "plugin-authorized"
+            return [{"action": "allow"}]
+
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _hook)
+
+        handled = await GatewayRunner._handle_active_session_busy_message(
+            runner, event, session_key
+        )
+
+        assert handled is True
+        assert seen == ["untrusted"]
+        assert adapter._pending_messages[session_key] is event
+
+    @pytest.mark.asyncio
+    async def test_busy_hook_sanitizes_media_before_queueing(self, monkeypatch):
+        """Sanitized media remains sanitized when the queued follow-up replays."""
+        from gateway.run import GatewayRunner
+
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "queue"
+        adapter = _make_adapter()
+        event = _make_event(text="inspect this")
+        event.media_urls = ["/tmp/untrusted-image.png"]
+        event.media_types = ["image/png"]
+        session_key = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+        monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
+
+        def _hook(_name, **kwargs):
+            kwargs["event"].media_urls[:] = ["/tmp/sanitized-image.png"]
+            return [{"action": "allow"}]
+
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _hook)
+
+        handled = await GatewayRunner._handle_active_session_busy_message(
+            runner, event, session_key
+        )
+
+        assert handled is True
+        queued = adapter._pending_messages[session_key]
+        assert queued is event
+        assert queued.media_urls == ["/tmp/sanitized-image.png"]

@@ -8357,7 +8357,64 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return text
         return (enriched_text or text).strip()
 
+    def _run_pre_gateway_dispatch_hook(
+        self, event: MessageEvent
+    ) -> tuple[MessageEvent, bool]:
+        """Run the inbound plugin hook and return ``(event, skipped)``.
+
+        This is shared by the ordinary dispatch and adapter-level busy paths.
+        It deliberately runs before authorization so plugins can authorize
+        dynamic senders and sanitize media before an event is queued, steered,
+        or delivered to the next agent turn.
+        """
+        if getattr(event, "internal", False):
+            return event, False
+
+        try:
+            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+
+            hook_results = _invoke_hook(
+                "pre_gateway_dispatch",
+                event=event,
+                gateway=self,
+                # Bare-runner tests build GatewayRunner via object.__new__
+                # without __init__; a missing store must not block hooks.
+                session_store=getattr(self, "session_store", None),
+            )
+        except Exception as hook_exc:
+            logger.warning("pre_gateway_dispatch invocation failed: %s", hook_exc)
+            hook_results = []
+
+        for result in hook_results:
+            if not isinstance(result, dict):
+                continue
+            action = result.get("action")
+            if action == "skip":
+                source = event.source
+                logger.info(
+                    "pre_gateway_dispatch skip: reason=%s platform=%s chat=%s",
+                    result.get("reason"),
+                    source.platform.value if source.platform else "unknown",
+                    source.chat_id or "unknown",
+                )
+                return event, True
+            if action == "rewrite":
+                new_text = result.get("text")
+                if isinstance(new_text, str):
+                    event = dataclasses.replace(event, text=new_text)
+                break
+            if action == "allow":
+                break
+
+        return event, False
+
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
+        # Match the cold path: plugins may authorize dynamic senders and
+        # sanitize event media before this event is queued or reaches an agent.
+        event, hook_skipped = self._run_pre_gateway_dispatch_hook(event)
+        if hook_skipped:
+            return True
+
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
         # creating a session.  The busy path must enforce the same check;
@@ -13633,49 +13690,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not is_internal:
             self._scale_to_zero_note_real_inbound()
 
-        # Fire pre_gateway_dispatch plugin hook for user-originated messages.
-        # Plugins receive the MessageEvent and may return a dict influencing flow:
-        #   {"action": "skip",    "reason": ...}    -> drop (no reply, plugin handled)
-        #   {"action": "rewrite", "text":  ...}     -> replace event.text, continue
-        #   {"action": "allow"}   /   None          -> normal dispatch
-        # Hook runs BEFORE auth so plugins can handle unauthorized senders
-        # (e.g. customer handover ingest) without triggering the pairing flow.
-        if not is_internal:
-            try:
-                from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-                _hook_results = _invoke_hook(
-                    "pre_gateway_dispatch",
-                    event=event,
-                    gateway=self,
-                    # getattr: bare-runner tests build GatewayRunner via
-                    # object.__new__ without __init__ (pitfall #17), and the
-                    # hook must not fail dispatch over a missing attribute.
-                    session_store=getattr(self, "session_store", None),
-                )
-            except Exception as _hook_exc:
-                logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)
-                _hook_results = []
-
-            for _result in _hook_results:
-                if not isinstance(_result, dict):
-                    continue
-                _action = _result.get("action")
-                if _action == "skip":
-                    logger.info(
-                        "pre_gateway_dispatch skip: reason=%s platform=%s chat=%s",
-                        _result.get("reason"),
-                        source.platform.value if source.platform else "unknown",
-                        source.chat_id or "unknown",
-                    )
-                    return None
-                if _action == "rewrite":
-                    _new_text = _result.get("text")
-                    if isinstance(_new_text, str):
-                        event = dataclasses.replace(event, text=_new_text)
-                        source = event.source
-                    break
-                if _action == "allow":
-                    break
+        # Plugins receive the MessageEvent before auth and can return:
+        #   {"action": "skip",    "reason": ...} -> drop (plugin handled)
+        #   {"action": "rewrite", "text":  ...} -> replace event.text
+        #   {"action": "allow"}   / None        -> normal dispatch
+        # The helper is also used by the adapter-level busy path, so dynamic
+        # authorization and media sanitization have identical cold/busy
+        # semantics before an event can be queued for a later turn.
+        event, hook_skipped = self._run_pre_gateway_dispatch_hook(event)
+        if hook_skipped:
+            return None
+        source = event.source
 
         if is_internal:
             pass
