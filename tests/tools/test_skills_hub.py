@@ -459,6 +459,7 @@ class TestCheckForSkillUpdates:
         assert len(results) == 1
         assert results[0]["name"] == "demo-skill"
         assert results[0]["status"] == "update_available"
+        assert results[0]["install_path"] == "demo-skill"
 
 class TestCreateSourceRouter:
 

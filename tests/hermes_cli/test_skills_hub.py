@@ -96,9 +96,6 @@ def _capture_update(monkeypatch, results) -> tuple[str, list[tuple[str, str, boo
     installs = []
 
     monkeypatch.setattr(hub, "check_for_skill_updates", lambda **_kwargs: results)
-    monkeypatch.setattr(hub, "HubLockFile", lambda: type("L", (), {
-        "get_installed": lambda self, name: {"install_path": "category/" + name}
-    })())
     monkeypatch.setattr(cli_hub, "do_install", lambda identifier, category="", force=False, console=None, source_id=None: installs.append((identifier, category, force)))
 
     do_update(console=console)
@@ -191,6 +188,19 @@ def test_check_for_skill_updates_does_not_fall_back_across_registries():
         "reporting update_available here is the cross-registry hijack"
     )
     assert "bundle" not in results[0], "must not carry a foreign registry's bundle"
+
+
+def test_do_update_keeps_categorized_install_path(monkeypatch):
+    """Updating a categorized skill must reinstall it in its existing category."""
+    _, installs = _capture_update(monkeypatch, [{
+        "name": "review",
+        "identifier": "owner/repo/review",
+        "source": "github",
+        "install_path": "engineering/review",
+        "status": "update_available",
+    }])
+
+    assert installs == [("owner/repo/review", "engineering", True)]
 
 
 

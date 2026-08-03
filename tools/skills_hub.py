@@ -3730,6 +3730,7 @@ def check_for_skill_updates(
                 "name": entry.get("name", ""),
                 "identifier": identifier,
                 "source": source_name,
+                "install_path": entry.get("install_path", ""),
                 "status": "unavailable",
             })
             continue
@@ -3748,6 +3749,7 @@ def check_for_skill_updates(
                 "name": entry.get("name", ""),
                 "identifier": identifier,
                 "source": source_name,
+                "install_path": entry.get("install_path", ""),
                 "status": "unavailable",
             })
             continue
@@ -3759,6 +3761,7 @@ def check_for_skill_updates(
             "name": entry.get("name", ""),
             "identifier": identifier,
             "source": source_name,
+            "install_path": entry.get("install_path", ""),
             "status": status,
             "current_hash": current_hash,
             "latest_hash": latest_hash,

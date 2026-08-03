@@ -1093,10 +1093,9 @@ def do_check(name: Optional[str] = None, console: Optional[Console] = None) -> N
 
 def do_update(name: Optional[str] = None, console: Optional[Console] = None) -> None:
     """Update hub-installed skills with upstream changes."""
-    from tools.skills_hub import HubLockFile, check_for_skill_updates
+    from tools.skills_hub import check_for_skill_updates
 
     c = console or _console
-    lock = HubLockFile()
     updates = [entry for entry in check_for_skill_updates(name=name) if entry.get("status") == "update_available"]
     if not updates:
         c.print("[dim]No updates available.[/]\n")
