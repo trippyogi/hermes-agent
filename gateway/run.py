@@ -8401,7 +8401,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if action == "rewrite":
                 new_text = result.get("text")
                 if isinstance(new_text, str):
-                    event = dataclasses.replace(event, text=new_text)
+                    # Mutate in place. The adapter busy-handler call site keeps
+                    # its original ``event`` reference and may queue it after a
+                    # ``return False`` fallthrough (busy_text_mode=queue); a
+                    # dataclasses.replace() here would silently drop the rewrite.
+                    event.text = new_text
                 break
             if action == "allow":
                 break

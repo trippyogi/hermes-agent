@@ -253,3 +253,33 @@ class TestBusySessionAuthBypass:
         queued = adapter._pending_messages[session_key]
         assert queued is event
         assert queued.media_urls == ["/tmp/sanitized-image.png"]
+
+    @pytest.mark.asyncio
+    async def test_busy_hook_rewrite_survives_queue_fallthrough(self, monkeypatch):
+        """Text rewrites must stick when the busy handler returns False.
+
+        With ``busy_text_mode=queue``, the handler falls through and the base
+        adapter queues its original event reference. A dataclasses.replace()
+        rewrite would be discarded; in-place mutation keeps the rewritten text.
+        """
+        from gateway.run import GatewayRunner
+
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        runner._busy_text_mode = "queue"
+        adapter = _make_adapter()
+        event = _make_event(text="original follow-up")
+        session_key = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+
+        def _hook(_name, **kwargs):
+            return [{"action": "rewrite", "text": "rewritten follow-up"}]
+
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _hook)
+
+        handled = await GatewayRunner._handle_active_session_busy_message(
+            runner, event, session_key
+        )
+
+        assert handled is False
+        assert event.text == "rewritten follow-up"
