@@ -5,7 +5,14 @@ import pytest
 from rich.console import Console
 
 from cli import ChatConsole
-from hermes_cli.skills_hub import do_check, do_install, do_list, do_update, handle_skills_slash
+from hermes_cli.skills_hub import (
+    do_check,
+    do_install,
+    do_list,
+    do_snapshot_import,
+    do_update,
+    handle_skills_slash,
+)
 
 
 class _DummyLockFile:
@@ -253,6 +260,77 @@ def _install_mocks(monkeypatch, tmp_path, source_factory, category_hint=""):
     monkeypatch.setattr(guard, "format_scan_report", lambda result: "scan ok")
     monkeypatch.setattr(guard, "should_allow_install", lambda result, force=False: (True, "ok"))
     return install_calls
+
+
+def test_do_install_rejects_same_name_from_different_source(monkeypatch, tmp_path):
+    """A full identifier must not overwrite a same-name skill from another source."""
+    import tools.skills_hub as hub
+
+    class _Source:
+        def inspect(self, identifier):
+            return type("Meta", (), {"extra": {}})()
+
+        def fetch(self, identifier):
+            return type("Bundle", (), {
+                "name": "review",
+                "files": {"SKILL.md": "# different review skill"},
+                "source": "clawhub",
+                "identifier": "review",
+                "trust_level": "community",
+                "metadata": {},
+            })()
+
+    existing = {
+        "name": "review",
+        "source": "github",
+        "identifier": "owner/repo/review",
+        "install_path": "review",
+    }
+    lock = type("Lock", (), {
+        "get_installed_by_identity": lambda self, source, identifier: None,
+        "list_installed": lambda self: [existing],
+    })()
+    quarantined = []
+    monkeypatch.setattr(hub, "ensure_hub_dirs", lambda: None)
+    monkeypatch.setattr(hub, "create_source_router", lambda auth: [_Source()])
+    monkeypatch.setattr(hub, "HubLockFile", lambda: lock)
+    monkeypatch.setattr(hub, "quarantine_bundle", lambda bundle: quarantined.append(bundle))
+    monkeypatch.setattr(hub, "SKILLS_DIR", tmp_path / "skills")
+
+    sink = StringIO()
+    do_install(
+        "clawhub/review",
+        force=True,
+        skip_confirm=True,
+        console=Console(file=sink, force_terminal=False, color_system=None),
+    )
+
+    assert not quarantined
+    assert "would replace the skill from github" in sink.getvalue()
+
+
+def test_snapshot_import_preserves_source_identity(monkeypatch, tmp_path):
+    """A snapshot restore must not resolve its identifier through another source."""
+    snapshot = tmp_path / "skills.json"
+    snapshot.write_text(
+        '{"skills": [{"name": "review", "identifier": "review", '
+        '"source": "clawhub", "category": "community"}]}',
+        encoding="utf-8",
+    )
+    installs = []
+    monkeypatch.setattr(
+        "hermes_cli.skills_hub.do_install",
+        lambda identifier, **kwargs: installs.append((identifier, kwargs)),
+    )
+
+    do_snapshot_import(str(snapshot), console=Console(file=StringIO()))
+
+    assert len(installs) == 1
+    identifier, kwargs = installs[0]
+    assert identifier == "review"
+    assert kwargs["category"] == "community"
+    assert kwargs["force"] is False
+    assert kwargs["source_id"] == "clawhub"
 
 
 

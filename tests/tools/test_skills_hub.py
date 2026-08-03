@@ -502,6 +502,26 @@ class TestHubLockFile:
         names = {e["name"] for e in installed}
         assert names == {"s1", "s2"}
 
+    def test_same_name_entries_are_keyed_by_source_identity(self, tmp_path):
+        lock = HubLockFile(path=tmp_path / "lock.json")
+        lock.record_install(
+            name="review", source="github", identifier="owner/repo/review",
+            trust_level="community", scan_verdict="pass",
+            skill_hash="first", install_path="github/review", files=["SKILL.md"],
+        )
+        lock.record_install(
+            name="review", source="clawhub", identifier="review",
+            trust_level="community", scan_verdict="pass",
+            skill_hash="second", install_path="clawhub/review", files=["SKILL.md"],
+        )
+
+        installed = lock.list_installed()
+
+        assert len(installed) == 2
+        assert {entry["name"] for entry in installed} == {"review"}
+        assert lock.get_installed_by_identity("github", "owner/repo/review")["content_hash"] == "first"
+        assert lock.get_installed_by_identity("clawhub", "review")["content_hash"] == "second"
+
 
 # ---------------------------------------------------------------------------
 # TapsManager

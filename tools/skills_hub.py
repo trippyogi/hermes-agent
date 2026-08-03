@@ -3317,6 +3317,17 @@ class HubLockFile:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
+    @staticmethod
+    def _identity_key(source: str, identifier: str) -> str:
+        """Return the lock-file key for one upstream skill.
+
+        A frontmatter name is a display label, not a globally unique identity:
+        multiple registries can legitimately publish a skill called ``review``.
+        Keep the source and its source-specific identifier together so updating
+        one cannot replace another merely because their display names match.
+        """
+        return f"{source}::{identifier}"
+
     def record_install(
         self,
         name: str,
@@ -3337,7 +3348,19 @@ class HubLockFile:
         safe_name = _validate_skill_name(name)
         safe_install_path = _normalize_lock_install_path(install_path, safe_name)
         data = self.load()
-        data["installed"][safe_name] = {
+        installed = data["installed"]
+        identity_key = self._identity_key(source, identifier)
+        # Migrate a pre-source-identity entry for this exact upstream skill
+        # lazily. Do not remove a same-name entry from a different source.
+        for key, entry in list(installed.items()):
+            if (
+                key != identity_key
+                and entry.get("source") == source
+                and entry.get("identifier") == identifier
+            ):
+                installed.pop(key)
+        installed[identity_key] = {
+            "name": safe_name,
             "source": source,
             "identifier": identifier,
             "trust_level": trust_level,
@@ -3357,15 +3380,55 @@ class HubLockFile:
         data["installed"].pop(name, None)
         self.save(data)
 
-    def get_installed(self, name: str) -> Optional[dict]:
+    def record_uninstall_identity(self, source: str, identifier: str) -> None:
         data = self.load()
-        return data["installed"].get(name)
+        installed = data["installed"]
+        identity_key = self._identity_key(source, identifier)
+        installed.pop(identity_key, None)
+        # Also remove a legacy name-keyed entry for the exact same source.
+        for key, entry in list(installed.items()):
+            if entry.get("source") == source and entry.get("identifier") == identifier:
+                installed.pop(key)
+        self.save(data)
+
+    def get_installed_by_identity(self, source: str, identifier: str) -> Optional[dict]:
+        data = self.load()
+        installed = data["installed"]
+        entry = installed.get(self._identity_key(source, identifier))
+        if entry is not None:
+            return entry
+        # Backward-compatible read of name-keyed lock files written before
+        # source identity became the primary key.
+        for candidate in installed.values():
+            if candidate.get("source") == source and candidate.get("identifier") == identifier:
+                return candidate
+        return None
+
+    def get_installed_by_name(self, name: str) -> List[dict]:
+        return [
+            {"name": entry_name, **entry}
+            for entry_name, entry in self.load()["installed"].items()
+            if entry.get("name", entry_name) == name
+        ]
+
+    def get_installed(self, name: str) -> Optional[dict]:
+        """Return the lone installed skill with this display name, if any.
+
+        Kept for callers that still operate on legacy name-only lock files.
+        New install/update paths must use ``get_installed_by_identity``.
+        """
+        data = self.load()
+        direct = data["installed"].get(name)
+        if direct is not None:
+            return direct
+        matches = self.get_installed_by_name(name)
+        return matches[0] if len(matches) == 1 else None
 
     def list_installed(self) -> List[dict]:
         data = self.load()
         result = []
-        for name, entry in data["installed"].items():
-            result.append({"name": name, **entry})
+        for lock_key, entry in data["installed"].items():
+            result.append({"name": entry.get("name", lock_key), **entry})
         return result
 
 
@@ -3571,9 +3634,21 @@ def install_from_quarantine(
 def uninstall_skill(skill_name: str) -> Tuple[bool, str]:
     """Remove a hub-installed skill. Refuses to remove builtins."""
     lock = HubLockFile()
-    entry = lock.get_installed(skill_name)
-    if not entry:
+    installed = lock.list_installed()
+    identifier_entries = [
+        entry for entry in installed if entry.get("identifier") == skill_name
+    ]
+    named_entries = identifier_entries or lock.get_installed_by_name(skill_name)
+    if not named_entries:
         return False, f"'{skill_name}' is not a hub-installed skill (may be a builtin)"
+    if len(named_entries) > 1:
+        identifiers = ", ".join(entry.get("identifier", "") for entry in named_entries)
+        return False, (
+            f"Multiple installed skills are named '{skill_name}'. "
+            f"Use their source identifier to uninstall one: {identifiers}"
+        )
+    entry = named_entries[0]
+    display_name = entry["name"]
 
     # Validate the lock entry's install_path against the skill name. This is
     # the destructive boundary — anything that falls through to the rmtree
@@ -3584,18 +3659,18 @@ def uninstall_skill(skill_name: str) -> Tuple[bool, str]:
     # component-by-component refusing symlink/junction redirects.
     try:
         install_path = _resolve_lock_install_path(
-            entry.get("install_path", ""), skill_name
+            entry.get("install_path", ""), display_name
         )
     except ValueError as exc:
-        return False, f"Refusing to uninstall '{skill_name}': {exc}"
+        return False, f"Refusing to uninstall '{display_name}': {exc}"
 
     if install_path.exists():
         shutil.rmtree(install_path)
 
-    lock.record_uninstall(skill_name)
-    append_audit_log("UNINSTALL", skill_name, entry["source"], entry["trust_level"], "n/a", "user_request")
+    lock.record_uninstall_identity(entry["source"], entry["identifier"])
+    append_audit_log("UNINSTALL", display_name, entry["source"], entry["trust_level"], "n/a", "user_request")
 
-    return True, f"Uninstalled '{skill_name}' from {entry['install_path']}"
+    return True, f"Uninstalled '{display_name}' from {entry['install_path']}"
 
 
 def bundle_content_hash(bundle: SkillBundle) -> str:

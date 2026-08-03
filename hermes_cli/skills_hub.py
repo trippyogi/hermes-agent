@@ -638,12 +638,40 @@ def do_install(identifier: str, category: str = "", force: bool = False,
 
     # Check if already installed
     lock = HubLockFile()
-    existing = lock.get_installed(bundle.name)
+    existing = lock.get_installed_by_identity(bundle.source, bundle.identifier)
     if existing:
         c.print(f"[yellow]Warning:[/] '{bundle.name}' is already installed at {existing['install_path']}")
         if not force:
             c.print("Use --force to reinstall.\n")
             return
+    target_path = f"{category}/{bundle.name}" if category else bundle.name
+    path_conflict = next(
+        (
+            entry for entry in lock.list_installed()
+            if entry.get("install_path") == target_path
+            and (
+                entry.get("source") != bundle.source
+                or entry.get("identifier") != bundle.identifier
+            )
+        ),
+        None,
+    )
+    if path_conflict:
+        c.print(
+            f"[bold red]Cannot install:[/] '{bundle.name}' would replace "
+            f"the skill from {path_conflict.get('source', 'an unknown source')} "
+            f"({path_conflict.get('identifier', '')}).\n"
+            "Choose a different --category to keep both skills.\n"
+        )
+        return
+    from tools.skills_hub import SKILLS_DIR
+    target_dir = SKILLS_DIR / target_path
+    if target_dir.exists() and not existing:
+        c.print(
+            f"[bold red]Cannot install:[/] '{target_path}' already exists but "
+            "is not the requested source identity. Refusing to overwrite it.\n"
+        )
+        return
 
     extra_metadata = dict(getattr(meta, "extra", {}) or {})
     extra_metadata.update(getattr(bundle, "metadata", {}) or {})
@@ -748,7 +776,6 @@ def do_install(identifier: str, category: str = "", force: bool = False,
         append_audit_log("BLOCKED", bundle.name, bundle.source,
                          bundle.trust_level, "invalid_path", str(exc))
         return
-    from tools.skills_hub import SKILLS_DIR
     c.print(f"[bold green]Installed:[/] {install_dir.relative_to(SKILLS_DIR)}")
     c.print(f"[dim]Files: {', '.join(bundle.files.keys())}[/]\n")
 
@@ -1076,8 +1103,7 @@ def do_update(name: Optional[str] = None, console: Optional[Console] = None) -> 
         return
 
     for entry in updates:
-        installed = lock.get_installed(entry["name"])
-        category = _derive_category_from_install_path(installed.get("install_path", "")) if installed else ""
+        category = _derive_category_from_install_path(entry.get("install_path", ""))
         c.print(f"[bold]Updating:[/] {entry['name']}")
         # Pin the update to the source registry recorded in the lockfile.
         # Without this, a bare (slash-less) identifier such as "reddit" falls
@@ -1725,7 +1751,13 @@ def do_snapshot_import(input_path: str, force: bool = False,
             continue
 
         c.print(f"[bold]--- {entry.get('name', identifier)} ---[/]")
-        do_install(identifier, category=category, force=force, console=c)
+        do_install(
+            identifier,
+            category=category,
+            force=force,
+            console=c,
+            source_id=entry.get("source", "") or None,
+        )
 
     c.print("[bold green]Snapshot import complete.[/]\n")
 
