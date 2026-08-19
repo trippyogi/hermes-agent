@@ -285,6 +285,52 @@ async def test_start_gateway_replace_clears_marker_on_permission_denied(
 
 
 @pytest.mark.asyncio
+async def test_start_gateway_replace_refuses_foreign_hermes_home(
+    monkeypatch, tmp_path
+):
+    """--replace must not SIGTERM a PID whose pid-file hermes_home is another profile."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    terminate_calls = []
+    takeover_calls = []
+
+    def record_terminate(pid, force=False):
+        terminate_calls.append((pid, force))
+        raise AssertionError("must not SIGTERM a foreign-profile PID")
+
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: 4242)
+    monkeypatch.setattr("gateway.status.get_process_start_time", lambda pid: 1.0)
+    monkeypatch.setattr(
+        "gateway.status._read_pid_record",
+        lambda pid_path=None: {
+            "pid": 4242,
+            "hermes_home": str(tmp_path / "foreign-profile"),
+            "kind": "hermes-gateway",
+        },
+    )
+    monkeypatch.setattr(
+        "gateway.status.write_takeover_marker",
+        lambda *a, **k: takeover_calls.append(a) or True,
+    )
+    monkeypatch.setattr("gateway.status.terminate_pid", record_terminate)
+    monkeypatch.setattr("gateway.run.os.getpid", lambda: 100)
+    monkeypatch.setattr("tools.skills_sync.sync_skills", lambda quiet=True: None)
+    monkeypatch.setattr(
+        "hermes_logging.setup_logging", lambda hermes_home, mode: tmp_path
+    )
+    monkeypatch.setattr(
+        "hermes_logging._add_rotating_handler", lambda *args, **kwargs: None
+    )
+
+    from gateway.run import start_gateway
+
+    ok = await start_gateway(config=GatewayConfig(), replace=True, verbosity=None)
+
+    assert ok is False
+    assert terminate_calls == []
+    assert takeover_calls == []
+
+
+@pytest.mark.asyncio
 async def test_runner_degrades_gracefully_when_all_adapters_missing(monkeypatch, tmp_path, caplog):
     """When all enabled platforms have no adapter (missing library or credentials),
     the gateway should NOT return failure — it should warn and continue running for
