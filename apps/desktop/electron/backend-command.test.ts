@@ -2,14 +2,70 @@ import assert from 'node:assert/strict'
 
 import { test } from 'vitest'
 
-import { dashboardFallbackArgs, serveBackendArgs, sourceDeclaresServe } from './backend-command'
+import {
+  dashboardFallbackArgs,
+  desktopBackendProfileIdentity,
+  parseStoredDesktopProfile,
+  poolBackendSpawnPlan,
+  primaryBackendSpawnPlan,
+  profileFlagFromArgs,
+  serveBackendArgs,
+  sourceDeclaresServe
+} from './backend-command'
 
-test('serveBackendArgs builds a headless serve invocation', () => {
-  assert.deepEqual(serveBackendArgs(), ['serve', '--host', '127.0.0.1', '--port', '0'])
+function assertSpawnIdentity(identity: string, args: string[]) {
+  assert.equal(identity, desktopBackendProfileIdentity(identity))
+  assert.equal(profileFlagFromArgs(args), identity)
+  assert.deepEqual(args, ['--profile', identity, 'serve', '--host', '127.0.0.1', '--port', '0'])
+}
+
+test('absent active-profile.json pins explicit --profile default', () => {
+  const plan = primaryBackendSpawnPlan(undefined)
+  assert.equal(parseStoredDesktopProfile(undefined), null)
+  assertSpawnIdentity('default', plan.args)
+  assert.equal(plan.identity, 'default')
 })
 
-test('serveBackendArgs pins a profile when provided', () => {
-  assert.deepEqual(serveBackendArgs('worker'), ['--profile', 'worker', 'serve', '--host', '127.0.0.1', '--port', '0'])
+test('stored profile null pins explicit --profile default', () => {
+  const plan = primaryBackendSpawnPlan({ profile: null })
+  assert.equal(parseStoredDesktopProfile({ profile: null }), null)
+  assertSpawnIdentity('default', plan.args)
+  assert.equal(plan.identity, 'default')
+})
+
+test('stored profile empty string pins explicit --profile default', () => {
+  const plan = primaryBackendSpawnPlan({ profile: '' })
+  assert.equal(parseStoredDesktopProfile({ profile: '' }), null)
+  assertSpawnIdentity('default', plan.args)
+  assert.equal(plan.identity, 'default')
+})
+
+test('stored named profile pins that name in argv and metadata', () => {
+  const plan = primaryBackendSpawnPlan({ profile: 'hank' })
+  assert.equal(parseStoredDesktopProfile({ profile: 'hank' }), 'hank')
+  assertSpawnIdentity('hank', plan.args)
+  assert.equal(plan.identity, 'hank')
+})
+
+test('missing active-profile.json relaunch still pins --profile default', () => {
+  const relaunch = primaryBackendSpawnPlan(null)
+  assertSpawnIdentity('default', relaunch.args)
+  assert.equal(relaunch.identity, 'default')
+})
+
+test('serveBackendArgs never omits --profile, even with no argument', () => {
+  assertSpawnIdentity('default', serveBackendArgs())
+  assertSpawnIdentity('default', serveBackendArgs(''))
+  assertSpawnIdentity('default', serveBackendArgs(null))
+  assertSpawnIdentity('worker', serveBackendArgs('worker'))
+})
+
+test('pool spawn always includes --profile <profile>', () => {
+  assertSpawnIdentity('default', poolBackendSpawnPlan('').args)
+  assertSpawnIdentity('default', poolBackendSpawnPlan('default').args)
+  assertSpawnIdentity('hank', poolBackendSpawnPlan('hank').args)
+  assertSpawnIdentity('apollo', poolBackendSpawnPlan('apollo').args)
+  assert.equal(poolBackendSpawnPlan('hank').identity, 'hank')
 })
 
 test('dashboardFallbackArgs rewrites serve -> dashboard --no-open, keeping the -m prefix', () => {
@@ -40,6 +96,13 @@ test('dashboardFallbackArgs preserves a --profile flag ahead of serve', () => {
     '--port',
     '0'
   ])
+})
+
+test('dashboardFallbackArgs keeps explicit default identity from serveBackendArgs', () => {
+  const rewritten = dashboardFallbackArgs(['-m', 'hermes_cli.main', ...serveBackendArgs()])
+  assert.equal(profileFlagFromArgs(rewritten), 'default')
+  assert.ok(rewritten.includes('dashboard'))
+  assert.ok(!rewritten.includes('serve'))
 })
 
 test('dashboardFallbackArgs is a no-op (copy) when there is no serve token', () => {

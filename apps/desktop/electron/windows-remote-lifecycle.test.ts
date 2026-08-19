@@ -138,7 +138,8 @@ test('Windows SSH reuse requires the requested remote profile to match the lock'
 
   assert.equal(reusableWindowsLock(lock, state, 'default', token, runtime), true)
   assert.equal(reusableWindowsLock(lock, state, 'desktop-work', token, runtime), false)
-  assert.equal(reusableWindowsLock({ ...lock, profile: '' }, state, '', token, runtime), true)
+  assert.equal(reusableWindowsLock({ ...lock, profile: '' }, state, 'default', token, runtime), false)
+  assert.equal(reusableWindowsLock({ ...lock, profile: 'hank' }, state, 'hank', token, runtime), true)
 })
 
 test('Windows integrated terminal uses encoded PowerShell and preserves cwd as literal data', () => {

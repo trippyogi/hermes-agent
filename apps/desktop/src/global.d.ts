@@ -692,8 +692,8 @@ export interface HermesWindowState {
 }
 
 export interface DesktopActiveProfile {
-  // The desktop's stored profile preference, or null when unset (legacy launch
-  // that defers to the sticky active_profile / default).
+  // The desktop's stored profile preference, or null when unset. Backend spawn
+  // still pins `--profile default` for null/empty so the child is never identity-less.
   profile: string | null
 }
 

@@ -27,6 +27,7 @@
 
 import crypto from 'node:crypto'
 
+import { desktopBackendProfileIdentity } from './backend-command'
 import { parseRemoteProfileListing } from './connection-registry'
 
 const LOCKFILE_SCHEMA_VERSION = 2
@@ -522,7 +523,8 @@ async function cleanupStale(ssh, ownershipId, lock, pidAlive = true) {
 // fd-detachment is already handled by </dev/null + redirect + &).
 function buildSpawnCommand(hermesPath, profile, opts: any = {}) {
   const hermes = expandRemotePath(hermesPath)
-  const profileArgs = profile ? `--profile ${shq(profile)} ` : ''
+  const identity = desktopBackendProfileIdentity(profile)
+  const profileArgs = `--profile ${shq(identity)} `
   const logPath = expandRemotePath(opts.logPath)
   const tokenFilePath = opts.tokenFilePath
   const tokenArg = tokenFilePath ? ` --ssh-session-token-file ${expandRemotePath(tokenFilePath)}` : ''
@@ -754,7 +756,7 @@ async function adoptOwnedServedToken(adoptServedToken, baseUrl, expectedToken, s
 async function connect(deps) {
   const {
     ssh,
-    profile = '',
+    profile: requestedProfile = '',
     remoteHermesPath = '',
     ownershipId,
     forward,
@@ -766,6 +768,7 @@ async function connect(deps) {
     readyTimeoutMs = DEFAULT_READY_TIMEOUT_MS,
     signal
   } = deps
+  const profile = desktopBackendProfileIdentity(requestedProfile)
 
   const log = msg => rememberLog(`[ssh-lifecycle] ${msg}`)
 

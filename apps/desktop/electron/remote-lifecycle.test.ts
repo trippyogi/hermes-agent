@@ -48,7 +48,7 @@ function ownedLock(over: any = {}) {
     spawnNonce: SPAWN_NONCE,
     pid: 333,
     port: 40000,
-    profile: '',
+    profile: 'default',
     hermesPath: '~/.local/bin/hermes',
     hermesHome: '~/.hermes',
     logPath: spawnLogPath(OWNERSHIP_ID, SPAWN_NONCE),
@@ -507,6 +507,20 @@ test('buildSpawnCommand is headless serve, detached, token not in argv', () => {
   assert.ok(!cmd.includes('HERMES_DASHBOARD_SESSION_TOKEN'), 'token env var must not appear')
 })
 
+test('buildSpawnCommand pins a named Desktop profile on remote argv', () => {
+  const cmd = buildSpawnCommand('/x/hermes', 'hank', { logPath: spawnLogPath(OWNERSHIP_ID, SPAWN_NONCE) })
+  assert.match(cmd, /--profile/)
+  assert.ok(cmd.includes('hank'))
+  assert.match(cmd, /serve --isolated/)
+})
+
+test('buildSpawnCommand pins --profile default when Desktop profile is empty', () => {
+  const cmd = buildSpawnCommand('/x/hermes', '', { logPath: spawnLogPath(OWNERSHIP_ID, SPAWN_NONCE) })
+  assert.match(cmd, /--profile/)
+  assert.ok(cmd.includes('default'))
+  assert.match(cmd, /serve --isolated/)
+})
+
 test('buildSpawnCommand always uses serve (legacy dashboard path removed)', () => {
   const cmd = buildSpawnCommand('/x/hermes', 'work', { logPath: spawnLogPath(OWNERSHIP_ID, SPAWN_NONCE) })
   assert.match(cmd, /serve --isolated/)
@@ -645,6 +659,84 @@ test('connect() spawns fresh when there is no lockfile, adopts the served token'
   assert.equal(result.token, 'the-served-token')
   assert.equal(result.baseUrl, 'http://127.0.0.1:50001')
   assert.equal(result.tokenFingerprint, fingerprintToken('the-served-token'))
+})
+
+test('connect() lockfile profile agrees with explicit remote argv identity', async () => {
+  const ssh = fakeSsh([
+    [/uname/, 'Linux\nx86_64'],
+    [/\[ -x/, 'OK'],
+    [/cat .*lock\.json/, ''],
+    [/grep -q ssh-session-token-file/, 'YES\n'],
+    [/python3 -c/, ''],
+    [/printf '%s'/, ''],
+    [/setsid/, '779\n'],
+    [/kill -0 779/, 'ALIVE'],
+    [/cat .*\.log/, 'HERMES_DASHBOARD_READY port=52100\n']
+  ])
+
+  await connect(connectDeps(ssh, { profile: '', adoptServedToken: async () => 'lock-identity-token' }))
+
+  const spawn = ssh.calls.find(command => /setsid|nohup/.test(command)) || ''
+  assert.match(spawn, /--profile/)
+  assert.ok(spawn.includes('default'))
+  assert.match(spawn, /serve --isolated/)
+
+  const lockWrite = ssh.calls.find(command => /printf '%s'/.test(command) && /backend\.lock\.json/.test(command)) || ''
+  assert.match(lockWrite, /"profile":"default"/)
+})
+
+test('connect() preserves a named Desktop profile on remote argv and lockfile', async () => {
+  const ssh = fakeSsh([
+    [/uname/, 'Linux\nx86_64'],
+    [/\[ -x/, 'OK'],
+    [/cat .*lock\.json/, ''],
+    [/grep -q ssh-session-token-file/, 'YES\n'],
+    [/python3 -c/, ''],
+    [/printf '%s'/, ''],
+    [/setsid/, '780\n'],
+    [/kill -0 780/, 'ALIVE'],
+    [/cat .*\.log/, 'HERMES_DASHBOARD_READY port=52101\n']
+  ])
+
+  await connect(connectDeps(ssh, { profile: 'hank', adoptServedToken: async () => 'hank-token' }))
+
+  const spawn = ssh.calls.find(command => /setsid|nohup/.test(command)) || ''
+  assert.match(spawn, /--profile/)
+  assert.ok(spawn.includes('hank'))
+  assert.match(spawn, /serve --isolated/)
+
+  const lockWrite = ssh.calls.find(command => /printf '%s'/.test(command) && /backend\.lock\.json/.test(command)) || ''
+  assert.match(lockWrite, /"profile":"hank"/)
+})
+
+test('connect() does not reuse an identity-less lock against Desktop default', async () => {
+  const reuseToken = 'stored-token'
+  const lock = ownedLock({ profile: '', tokenFingerprint: fingerprintToken(reuseToken) })
+
+  const ssh = fakeSsh([
+    [/uname/, 'Linux\nx86_64'],
+    [/\[ -x/, 'OK'],
+    [/cat .*lock\.json/, JSON.stringify(lock)],
+    [/kill -0 333/, 'ALIVE'],
+    [/print\("OWNED"/, 'OWNED\n'],
+    [/kill 333/, ''],
+    [/--version/, 'Hermes Agent v0.18.2\n'],
+    [/grep -q ssh-session-token-file/, 'YES\n'],
+    [/python3 -c/, ''],
+    [/setsid/, '891\n'],
+    [/kill -0 891/, 'ALIVE'],
+    [/cat .*\.log/, 'HERMES_DASHBOARD_READY port=52051\n']
+  ])
+
+  const result = await connect(
+    connectDeps(ssh, { profile: '', reuseToken, adoptServedToken: async () => 'fresh-default' })
+  )
+
+  assert.equal(result.reused, false)
+  const spawn = ssh.calls.find(command => /setsid|nohup/.test(command)) || ''
+  assert.match(spawn, /--profile/)
+  assert.ok(spawn.includes('default'))
+  assert.match(spawn, /serve --isolated/)
 })
 
 test('managed SSH maps a local scope to a different non-default remote profile', async () => {

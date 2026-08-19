@@ -1,5 +1,6 @@
 import crypto from 'node:crypto'
 
+import { desktopBackendProfileIdentity } from './backend-command'
 import { redactSecrets, SSH_ERROR } from './ssh-connection'
 
 const LOCKFILE_SCHEMA_VERSION = 2
@@ -273,7 +274,7 @@ async function connectWindowsRemote(deps) {
   const {
     ssh,
     ownershipId,
-    profile = '',
+    profile: requestedProfile = '',
     remoteHermesPath = '',
     reuseToken = '',
     signal,
@@ -285,6 +286,7 @@ async function connectWindowsRemote(deps) {
     rememberLog = () => {},
     readyTimeoutMs = 45_000
   } = deps
+  const profile = desktopBackendProfileIdentity(requestedProfile)
 
   assertCurrent(signal)
   const runtime = await probeWindowsRemote(ssh, remoteHermesPath)

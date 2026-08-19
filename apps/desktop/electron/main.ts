@@ -33,7 +33,14 @@ import nodePty from 'node-pty'
 
 import { classifyActiveRuntime } from './active-runtime-state'
 import { stopBackendChild as stopBackendChildImpl, stopBackendTreesForUpdate } from './backend-child'
-import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
+import {
+  dashboardFallbackArgs,
+  desktopBackendProfileIdentity,
+  parseStoredDesktopProfile,
+  poolBackendSpawnPlan,
+  serveBackendArgs,
+  sourceDeclaresServe
+} from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
 import { buildDesktopBackendEnv, hermesManagedNodePathEntries, normalizeHermesHomeRoot } from './backend-env'
 import { isReauthRequiredError, waitForHermesReady } from './backend-health'
@@ -764,11 +771,12 @@ const DESKTOP_UPDATE_CONFIG_PATH = path.join(app.getPath('userData'), 'updates.j
 const DESKTOP_WINDOW_STATE_PATH = path.join(app.getPath('userData'), 'window-state.json')
 const DESKTOP_BACKEND_OWNERSHIP_PATH = path.join(app.getPath('userData'), 'backend-ownership.json')
 // active-profile.json records which Hermes profile the desktop launches its
-// local backend as. When set, startHermes() passes `hermes --profile <name>
-// dashboard …`, which deterministically pins HERMES_HOME (see
-// _apply_profile_override in hermes_cli/main.py) and bypasses the sticky
-// ~/.hermes/active_profile file. Unset (null) preserves the legacy behavior:
-// no --profile flag, so the backend honors active_profile / default.
+// local backend as. startHermes() always passes `hermes --profile <identity>
+// serve …` via serveBackendArgs(), which deterministically pins HERMES_HOME
+// (see _apply_profile_override in hermes_cli/main.py) and bypasses the sticky
+// ~/.hermes/active_profile file. Unset / empty stored preference is the
+// Desktop identity `default`, not a profile-less child. CLI sticky-profile
+// remains a CLI-only concern.
 const DESKTOP_PROFILE_CONFIG_PATH = path.join(app.getPath('userData'), 'active-profile.json')
 // Mirrors hermes_cli.profiles._PROFILE_ID_RE so we never hand the backend a
 // value its profile resolver would reject and exit on.
@@ -8428,20 +8436,16 @@ async function saveRegistryConnection(input: any = {}) {
   return sanitizeRegistryConnection(entry)
 }
 
-// Returns the desktop's chosen profile name, or null when unset. "default" is
-// a valid stored value (pins the root HERMES_HOME explicitly); null means "no
-// preference" and preserves the legacy launch (no --profile flag).
+// Returns the desktop's stored profile preference, or null when unset.
+// "default" is a valid stored value (pins the root HERMES_HOME explicitly).
+// Spawn identity still goes through desktopBackendProfileIdentity() so a
+// missing file cannot launch a profile-less backend.
 function readActiveDesktopProfile() {
   try {
     const raw = fs.readFileSync(DESKTOP_PROFILE_CONFIG_PATH, 'utf8')
-    const parsed = JSON.parse(raw)
-    const name = parsed && typeof parsed.profile === 'string' ? parsed.profile.trim() : ''
-
-    if (name && (name === 'default' || PROFILE_NAME_RE.test(name))) {
-      return name
-    }
+    return parseStoredDesktopProfile(JSON.parse(raw))
   } catch {
-    // Missing or malformed → no preference.
+    // Missing or malformed → no stored preference.
   }
 
   return null
@@ -9639,11 +9643,10 @@ async function waitForBackendExit(child, timeoutMs = 5000) {
   await wait(1000)
 }
 
-// The profile the primary (window) backend runs as. readActiveDesktopProfile()
-// returns the desktop's stored preference, or null when unset (legacy launch
-// that defers to active_profile / default).
+// The profile the primary (window) backend runs as. Missing / empty stored
+// preference is `default` — the same identity serveBackendArgs() pins.
 function primaryProfileKey() {
-  return readActiveDesktopProfile() || 'default'
+  return desktopBackendProfileIdentity(readActiveDesktopProfile())
 }
 
 // Options describing the current connection setup for `resolveProfileBackendRoute`.
@@ -10077,7 +10080,8 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   // --profile wins over the inherited HERMES_HOME env (see _apply_profile_override
   // step 3 in hermes_cli/main.py), so the child re-homes to this profile.
   // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
-  const backendArgs = ['--profile', profile, 'serve', '--host', '127.0.0.1', '--port', '0']
+  const spawnPlan = poolBackendSpawnPlan(profile)
+  const backendArgs = spawnPlan.args
   const backend = await ensureRuntime(resolveHermesBackend(backendArgs))
   // Route old runtimes (no `serve`) through the legacy `dashboard --no-open`.
   backend.args = getBackendArgsForRuntime(backend)
@@ -10085,7 +10089,7 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   const webDist = resolveWebDist()
   const readyFile = backend.readyFile ? makeDashboardReadyFile() : null
 
-  rememberLog(`Starting Hermes backend for profile "${profile}" via ${backend.label}`)
+  rememberLog(`Starting Hermes backend for profile "${spawnPlan.identity}" via ${backend.label}`)
 
   const parentStartMarker = await desktopParentStartMarker()
   assertLocalProfileCanStart(profile, profileDeletionGate, key =>
@@ -10125,7 +10129,7 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
 
   entry.process = child
   entry.token = token
-  await claimBackendChild(child, `${backend.command} ${backend.args.join(' ')}`, profile, backendNonce)
+  await claimBackendChild(child, `${backend.command} ${backend.args.join(' ')}`, spawnPlan.identity, backendNonce)
 
   child.stdout.on('data', rememberLog)
   child.stderr.on('data', rememberLog)
@@ -10401,17 +10405,10 @@ async function startHermes() {
 
     const token = crypto.randomBytes(32).toString('base64url')
     // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
-    const backendArgs = ['serve', '--host', '127.0.0.1', '--port', '0']
-    // Pin the desktop's chosen profile via the global --profile flag. This is
-    // deterministic (it wins over the sticky ~/.hermes/active_profile file) and
-    // resolves HERMES_HOME the same way `hermes -p <name>` does on the CLI. An
-    // unset preference keeps the legacy launch so existing installs are
-    // unaffected.
-    const activeProfile = readActiveDesktopProfile()
-
-    if (activeProfile) {
-      backendArgs.unshift('--profile', activeProfile)
-    }
+    // Always pin `--profile <primaryProfileKey()>`. Unset active-profile.json
+    // is Desktop identity `default`, not a profile-less sticky-CLI launch.
+    const profile = primaryProfileKey()
+    const backendArgs = serveBackendArgs(profile)
 
     const setup = await runPrimaryBackendStartup({
       connectRemote,
@@ -10448,7 +10445,6 @@ async function startHermes() {
     await advanceBootProgress('backend.spawn', `Starting Hermes backend via ${backend.label}`, 84)
     rememberLog(`Starting Hermes backend via ${backend.label}`)
 
-    const profile = primaryProfileKey()
     const parentStartMarker = await desktopParentStartMarker()
     const backendNonce = crypto.randomBytes(16).toString('hex')
     const parentIdentityEnv = parentWatchdogEnv(process.pid, parentStartMarker, backendNonce)
