@@ -74,6 +74,27 @@ def test_partially_valid_platform_toolsets_no_runtime_warning(caplog):
     assert not any("#38798" in r.getMessage() for r in caplog.records)
 
 
+def test_explicit_empty_cli_is_not_replaced_by_default_composite():
+    """An explicit empty list must stay fail-closed: do not fall back to
+    hermes-cli just because other platforms have populated toolsets."""
+    config = {
+        "platform_toolsets": {
+            "cli": [],
+            "telegram": ["hermes-telegram"],
+            "discord": ["hermes-discord"],
+        }
+    }
+    empty_cli = _get_platform_tools(config, "cli")
+    default_cli = _get_platform_tools(
+        {"platform_toolsets": {"cli": ["hermes-cli"]}}, "cli"
+    )
+    assert empty_cli != default_cli
+    # Core composite members must not leak in from the platform default.
+    assert "web" not in empty_cli
+    assert "terminal" not in empty_cli
+    assert "file" not in empty_cli
+
+
 
 
 
