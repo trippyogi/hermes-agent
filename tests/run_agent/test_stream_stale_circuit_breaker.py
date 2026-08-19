@@ -15,6 +15,7 @@ The harness mirrors tests/run_agent/test_28161_anthropic_stream_pool_cleanup.py.
 """
 
 import threading
+import time
 
 import httpx
 import pytest
@@ -152,3 +153,86 @@ class TestStreamStaleCircuitBreaker:
 
         # At least one stale kill happened; the streak must have advanced.
         assert agent._consecutive_stale_streams >= 1
+
+
+class TestStaleBreakerHalfOpen:
+    """#89587 — unattended recovery without undoing the #60484 fail-fast latch."""
+
+    def test_open_blocks_immediately_then_probe_after_cooldown(self, monkeypatch):
+        """Past the threshold the next call fails instantly; after the
+        cooldown exactly one probe is allowed; a second call re-opens."""
+        from agent.chat_completion_helpers import (
+            _bump_stale_streak,
+            _check_stale_giveup,
+        )
+
+        monkeypatch.setenv("HERMES_STREAM_STALE_GIVEUP", "3")
+        agent = _make_anthropic_agent()
+        agent._stale_breaker_cooldown_seconds = 10.0
+        for _ in range(3):
+            _bump_stale_streak(agent)
+
+        with pytest.raises(RuntimeError, match="unresponsive"):
+            _check_stale_giveup(agent)
+        agent._anthropic_client.messages.stream.assert_not_called()
+
+        agent._stale_breaker_opened_at = time.monotonic() - 11.0
+        _check_stale_giveup(agent)  # half-open probe — must not raise
+
+        with pytest.raises(RuntimeError, match="unresponsive"):
+            _check_stale_giveup(agent)
+
+    def test_half_open_success_resets_streak(self, monkeypatch):
+        from agent.chat_completion_helpers import _bump_stale_streak
+
+        monkeypatch.setenv("HERMES_STREAM_STALE_GIVEUP", "3")
+        agent = _make_anthropic_agent()
+        agent._stale_breaker_cooldown_seconds = 10.0
+        for _ in range(3):
+            _bump_stale_streak(agent)
+        agent._stale_breaker_opened_at = time.monotonic() - 11.0
+        agent._anthropic_client.messages.stream.return_value = _good_stream_cm()
+
+        resp = agent._interruptible_streaming_api_call({})
+        assert resp is not None
+        assert agent._consecutive_stale_streams == 0
+        assert agent._stale_breaker_opened_at is None
+
+    def test_half_open_failure_reopens(self, monkeypatch):
+        from agent.chat_completion_helpers import (
+            _bump_stale_streak,
+            _check_stale_giveup,
+        )
+
+        monkeypatch.setenv("HERMES_STREAM_STALE_GIVEUP", "3")
+        agent = _make_anthropic_agent()
+        agent._stale_breaker_cooldown_seconds = 10.0
+        for _ in range(3):
+            _bump_stale_streak(agent)
+        agent._stale_breaker_opened_at = time.monotonic() - 11.0
+
+        _check_stale_giveup(agent)  # consume the probe slot
+        _bump_stale_streak(agent)  # probe failed — re-open
+
+        with pytest.raises(RuntimeError, match="unresponsive"):
+            _check_stale_giveup(agent)
+        assert agent._consecutive_stale_streams >= 3
+
+    def test_cooldown_zero_keeps_permanent_latch(self, monkeypatch):
+        """``stale_breaker_cooldown_seconds: 0`` preserves #60484 exactly."""
+        from agent.chat_completion_helpers import (
+            _bump_stale_streak,
+            _check_stale_giveup,
+        )
+
+        monkeypatch.setenv("HERMES_STREAM_STALE_GIVEUP", "3")
+        agent = _make_anthropic_agent()
+        agent._stale_breaker_cooldown_seconds = 0
+        for _ in range(3):
+            _bump_stale_streak(agent)
+        agent._stale_breaker_opened_at = time.monotonic() - 10_000.0
+
+        with pytest.raises(RuntimeError, match="unresponsive"):
+            _check_stale_giveup(agent)
+        with pytest.raises(RuntimeError, match="unresponsive"):
+            _check_stale_giveup(agent)

@@ -701,7 +701,7 @@ def _codex_wait_notice_recovery(
     return f"; auto-reconnect at {int(min(deadlines))}s"
 
 
-# ── Cross-turn stale-call circuit breaker (#58962) ─────────────────────
+# ── Cross-turn stale-call circuit breaker (#58962 / #89587) ────────────
 # A session wedged against an unresponsive provider hits the stale detector
 # on every call and loops forever (observed: 494 consecutive failures over
 # 3+ days, each burning the full stale timeout × retries with no response).
@@ -709,8 +709,20 @@ def _codex_wait_notice_recovery(
 # stale kill, reset only when a call actually completes (or when the
 # provider is swapped — switch_model / try_activate_fallback /
 # restore_primary_runtime — since the streak measured the OLD provider).
-# Past the give-up threshold, calls abort immediately with an actionable
-# error instead of re-waiting out the stale timeout.
+#
+# State machine (classic breaker, MCP-server sibling in tools/mcp_tool.py):
+#   closed    — streak below HERMES_STREAM_STALE_GIVEUP; calls go through.
+#   open      — threshold reached; calls abort immediately (no stale-timeout
+#               wait) until the cooldown elapses. This is the #60484 latch:
+#               interactive retries must NOT re-wait 900s every turn.
+#   half-open — cooldown elapsed; exactly one probe is allowed. Success
+#               closes the breaker. Failure re-opens it for another cooldown.
+#               ``agent.stale_breaker_cooldown_seconds`` (default 300, 0 =
+#               permanent latch) is the unattended recovery path for
+#               single-provider gateway/cron/kanban sessions (#89587).
+
+_STALE_BREAKER_COOLDOWN_DEFAULT = 300.0
+
 
 def _stale_streak(agent) -> int:
     try:
@@ -719,9 +731,43 @@ def _stale_streak(agent) -> int:
         return 0
 
 
+def _stamp_stale_breaker_opened(agent) -> None:
+    try:
+        agent._stale_breaker_opened_at = time.monotonic()
+    except Exception:
+        pass
+
+
+def _stale_breaker_cooldown_seconds(agent) -> float:
+    """Seconds the open breaker stays fail-fast before one half-open probe.
+
+    ``0`` disables half-open (permanent latch — the original #60484
+    behavior). Default 300s keeps interactive immediate retries fail-fast
+    while letting unattended sessions recover after a few minutes.
+    """
+    override = getattr(agent, "_stale_breaker_cooldown_seconds", None)
+    if isinstance(override, (int, float)) and not isinstance(override, bool):
+        return max(0.0, float(override))
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly()
+        agent_cfg = cfg.get("agent") if isinstance(cfg, dict) else None
+        if isinstance(agent_cfg, dict):
+            value = agent_cfg.get("stale_breaker_cooldown_seconds")
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return max(0.0, float(value))
+    except Exception:
+        pass
+    return _STALE_BREAKER_COOLDOWN_DEFAULT
+
+
 def _bump_stale_streak(agent) -> None:
     try:
         agent._consecutive_stale_streams = _stale_streak(agent) + 1
+        giveup = env_int("HERMES_STREAM_STALE_GIVEUP", 5)
+        if giveup > 0 and _stale_streak(agent) >= giveup:
+            _stamp_stale_breaker_opened(agent)
     except Exception:
         pass
 
@@ -729,6 +775,7 @@ def _bump_stale_streak(agent) -> None:
 def _reset_stale_streak(agent) -> None:
     try:
         agent._consecutive_stale_streams = 0
+        agent._stale_breaker_opened_at = None
     except Exception:
         pass
 
@@ -806,18 +853,56 @@ def _touch_stale_kill_activity(agent, elapsed: float) -> None:
         logger.debug("stale activity touch failed", exc_info=True)
 
 
+def _stale_giveup_error(streak: int, remaining: Optional[float] = None) -> RuntimeError:
+    msg = (
+        "Provider has been unresponsive (no response received) for "
+        f"{streak} consecutive stale attempts — aborting this call to "
+        "avoid an indefinite stall. Switch models or start a new "
+        "session, then retry."
+    )
+    if remaining is not None and remaining > 0:
+        msg += f" Auto-retry in ~{max(1, int(remaining))}s."
+    return RuntimeError(msg)
+
+
 def _check_stale_giveup(agent) -> None:
     """Raise immediately when the consecutive-stale streak is past the
-    give-up threshold — no network attempt, no stale-timeout wait."""
+    give-up threshold — no network attempt, no stale-timeout wait.
+
+    After ``agent.stale_breaker_cooldown_seconds`` (default 300) the
+    breaker half-opens: this call is allowed through as a single probe
+    and the open timestamp is re-armed so sibling/next calls stay
+    fail-fast. Probe success resets the streak; probe failure re-opens
+    the latch for another cooldown (#89587). Cooldown ``0`` keeps the
+    permanent #60484 latch.
+    """
     _giveup = env_int("HERMES_STREAM_STALE_GIVEUP", 5)
     _streak = _stale_streak(agent)
-    if _giveup > 0 and _streak >= _giveup:
-        raise RuntimeError(
-            "Provider has been unresponsive (no response received) for "
-            f"{_streak} consecutive stale attempts — aborting this call to "
-            "avoid an indefinite stall. Switch models or start a new "
-            "session, then retry."
-        )
+    if _giveup <= 0 or _streak < _giveup:
+        return
+
+    cooldown = _stale_breaker_cooldown_seconds(agent)
+    opened_at = getattr(agent, "_stale_breaker_opened_at", None)
+    if not isinstance(opened_at, (int, float)):
+        _stamp_stale_breaker_opened(agent)
+        raise _stale_giveup_error(_streak, cooldown if cooldown > 0 else None)
+
+    if cooldown <= 0:
+        raise _stale_giveup_error(_streak)
+
+    age = time.monotonic() - float(opened_at)
+    if age < cooldown:
+        raise _stale_giveup_error(_streak, cooldown - age)
+
+    # Half-open: one probe. Re-arm immediately so concurrent turns keep
+    # fail-fast and a hung probe cannot be followed by another 900s wait.
+    _stamp_stale_breaker_opened(agent)
+    logger.info(
+        "Stale-call breaker half-open after %.0fs cooldown; allowing one probe "
+        "(consecutive stale attempts=%d).",
+        age,
+        _streak,
+    )
 
 
 def _derive_stream_stale_timeout(agent, api_kwargs: dict) -> float:

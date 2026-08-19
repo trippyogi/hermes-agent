@@ -306,6 +306,14 @@ DEFAULT_CONFIG = {
         # detector instead of hanging forever. The env var
         # ``HERMES_LOCAL_STREAM_STALE_TIMEOUT`` overrides for escape-hatch use.
         "local_stream_stale_timeout": 900,
+        # Half-open cooldown for the cross-turn stale-call circuit breaker
+        # (#58962 / #89587), in seconds. After HERMES_STREAM_STALE_GIVEUP
+        # consecutive stale kills the breaker stays fail-fast for this long,
+        # then allows one real probe. Success resets the streak; failure
+        # re-opens the latch. Default 300s keeps interactive immediate
+        # retries fail-fast (the #60484 latch) while unattended
+        # gateway/cron/kanban sessions can recover. 0 = permanent latch.
+        "stale_breaker_cooldown_seconds": 300,
         # How user-attached images are presented to the main model on each turn.
         #   "auto"   — attach natively when the active model reports
         #              supports_vision=True AND the user hasn't explicitly

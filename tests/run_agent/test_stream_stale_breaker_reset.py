@@ -185,3 +185,20 @@ class TestNonStreamingSibling:
         resp = agent._interruptible_api_call({"model": "m", "messages": []})
         assert resp is not None
         assert agent._consecutive_stale_streams == 0
+
+    def test_non_streaming_half_open_probe_after_cooldown(self, monkeypatch):
+        """Unattended non-stream path (#89587): cooldown allows one probe."""
+        import time
+
+        monkeypatch.setenv("HERMES_STREAM_STALE_GIVEUP", "3")
+        agent = _make_fallback_agent(fallback_model=[])
+        agent._consecutive_stale_streams = 3
+        agent._stale_breaker_cooldown_seconds = 10.0
+        agent._stale_breaker_opened_at = time.monotonic() - 11.0
+        agent.client.chat.completions.create.return_value = MagicMock(
+            name="resp", choices=[MagicMock()]
+        )
+
+        resp = agent._interruptible_api_call({"model": "m", "messages": []})
+        assert resp is not None
+        assert agent._consecutive_stale_streams == 0
