@@ -1484,6 +1484,7 @@ export interface Translations {
     exported: string
     failedImport: string
     failedExport: string
+    failedSwitch: string
     allProfiles: string
     showAllProfiles: string
     switchToProfile: (name: string) => string

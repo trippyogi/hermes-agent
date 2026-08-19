@@ -1945,6 +1945,7 @@ export const zh: Translations = {
     exported: '配置档案已导出',
     failedImport: '导入配置档案失败',
     failedExport: '导出配置档案失败',
+    failedSwitch: '切换配置档案失败',
     allProfiles: '全部配置档案',
     showAllProfiles: '显示全部配置档案',
     switchToProfile: name => `切换到 ${name}`,

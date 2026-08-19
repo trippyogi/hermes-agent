@@ -234,6 +234,11 @@ function beginGatewayActivation(): number {
   return g.activationEpoch
 }
 
+/** Bump the activation epoch so an in-flight prepare thunk publishes nothing. */
+export function supersedeGatewayActivation(): void {
+  beginGatewayActivation()
+}
+
 function applyActive(profile: string, activationEpoch: number): boolean {
   if (gatewayActivationEpoch() !== activationEpoch) {
     return false

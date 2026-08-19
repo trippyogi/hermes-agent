@@ -55,6 +55,7 @@ const prepareGatewayForAgent = vi.fn(
 
 const prepareGatewayForProfile = vi.fn(async (_profile: string): Promise<() => boolean> => activateProfile)
 const openGatewayForProfile = vi.fn(async (_profile: string) => undefined)
+const supersedeGatewayActivation = vi.fn()
 const $gateway = atom<unknown>(INITIAL_GATEWAY)
 const resetStarmapGraph = vi.fn()
 
@@ -62,7 +63,8 @@ vi.mock('@/store/gateway', () => ({
   $gateway,
   openGatewayForProfile,
   prepareGatewayForAgent,
-  prepareGatewayForProfile
+  prepareGatewayForProfile,
+  supersedeGatewayActivation
 }))
 vi.mock('@/hermes', () => ({
   getProfiles: vi.fn(async () => ({ profiles: [] })),
@@ -70,6 +72,8 @@ vi.mock('@/hermes', () => ({
 }))
 vi.mock('@/lib/query-client', () => ({ invalidateProfileScopedQueries: vi.fn() }))
 vi.mock('@/store/starmap', () => ({ resetStarmapGraph }))
+vi.mock('@/store/notifications', () => ({ notifyError: vi.fn() }))
+vi.mock('@/i18n', () => ({ translateNow: (key: string) => key }))
 
 const { $activeGatewayProfile, ensureGatewayAgent, ensureGatewayProfile } = await import('./profile')
 const { $connection } = await import('./session')
@@ -155,7 +159,9 @@ describe('ensureGatewayAgent → $connection / $activeGatewayProfile sync', () =
     // between dial and publish. Nothing may publish, $gateway included.
     prepareGatewayForAgent.mockResolvedValueOnce(() => false)
 
-    await ensureGatewayAgent('removed-source', 'research')
+    await expect(ensureGatewayAgent('removed-source', 'research')).rejects.toThrow(
+      'Gateway activation was superseded'
+    )
 
     expect($activeGatewayProfile.get()).toBe('default')
     expect($connection.get()?.mode).toBe('local')
@@ -274,7 +280,7 @@ describe('ensureGatewayProfile publishes under the same activation guard', () =>
     const stop = $gateway.listen(gateway => seen.push(gateway))
 
     try {
-      await ensureGatewayProfile('worker')
+      await expect(ensureGatewayProfile('worker')).rejects.toThrow('Gateway activation was superseded')
     } finally {
       stop()
     }

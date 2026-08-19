@@ -2,6 +2,7 @@ import { atom, batch, computed } from 'nanostores'
 
 import type { HermesConnection } from '@/global'
 import { getProfiles, setApiRequestProfile, STARTUP_REQUEST_TIMEOUT_MS } from '@/hermes'
+import { translateNow } from '@/i18n'
 import { invalidateProfileScopedQueries } from '@/lib/query-client'
 import {
   arraysEqual,
@@ -13,7 +14,20 @@ import {
   storedStringRecord
 } from '@/lib/storage'
 import { invalidateCronModelImpactScopeState } from '@/store/cron-model-impact-scope'
-import { $gateway, openGatewayForProfile, prepareGatewayForAgent, prepareGatewayForProfile } from '@/store/gateway'
+import {
+  $gateway,
+  openGatewayForProfile,
+  prepareGatewayForAgent,
+  prepareGatewayForProfile,
+  supersedeGatewayActivation
+} from '@/store/gateway'
+import { notifyError } from '@/store/notifications'
+import {
+  awaitSerializedSwitch,
+  createSerializedSwitchLatch,
+  DEFAULT_GATEWAY_SWITCH_TIMEOUT_MS,
+  occupySerializedSwitch
+} from '@/store/serialized-switch'
 import { setConnection } from '@/store/session'
 import { resetStarmapGraph } from '@/store/starmap'
 import type { ProfileInfo } from '@/types/hermes'
@@ -268,7 +282,12 @@ export function prewarmProfileBackend(name: string): void {
   openGatewayForProfile(key).catch(() => undefined)
 }
 
-let gatewaySwitch: Promise<void> | null = null
+const gatewaySwitchLatch = createSerializedSwitchLatch()
+export const GATEWAY_SWITCH_TIMEOUT_MS = DEFAULT_GATEWAY_SWITCH_TIMEOUT_MS
+
+function abandonGatewaySwitch(): void {
+  supersedeGatewayActivation()
+}
 
 // The target profile's connection descriptor (mode / baseUrl / …), fetched
 // BEFORE activation so the switch can publish it in the same synchronous frame
@@ -301,8 +320,10 @@ export async function ensureGatewayProfile(profile: string | null | undefined): 
     // (e.g. the user just picked a profile in the switcher) is still in flight,
     // let it settle first so a new chat doesn't race session.create against a
     // half-open socket and land on the wrong backend.
-    if (gatewaySwitch) {
-      await gatewaySwitch.catch(() => undefined)
+    if (gatewaySwitchLatch.pending) {
+      await awaitSerializedSwitch(gatewaySwitchLatch, GATEWAY_SWITCH_TIMEOUT_MS, {
+        onAbandon: abandonGatewaySwitch
+      })
     }
 
     return
@@ -315,9 +336,12 @@ export async function ensureGatewayProfile(profile: string | null | undefined): 
   }
 
   // Serialize concurrent activations so two rapid session switches don't race
-  // the active pointer.
-  if (gatewaySwitch) {
-    await gatewaySwitch.catch(() => undefined)
+  // the active pointer. A hung previous occupancy is abandoned (timeout /
+  // already-expired) so a retry is not latched behind a never-settling promise.
+  if (gatewaySwitchLatch.pending) {
+    await awaitSerializedSwitch(gatewaySwitchLatch, GATEWAY_SWITCH_TIMEOUT_MS, {
+      onAbandon: abandonGatewaySwitch
+    })
 
     if (normalizeProfileKey($activeGatewayProfile.get()) === target && $gateway.get()) {
       return
@@ -325,52 +349,56 @@ export async function ensureGatewayProfile(profile: string | null | undefined): 
   }
 
   $gatewaySwapTarget.set(target)
-  gatewaySwitch = (async () => {
-    // Resolve the target's connection descriptor and open (or reuse) its
-    // socket BEFORE anything is published — without closing the profile you
-    // came from. The gateway used to be activated (and the profile atom set)
-    // while the descriptor fetch was still in flight, so during that window
-    // $gateway already targeted the new backend while $connection still
-    // described the previous one — and any request or plugin mode-listener
-    // firing then announced the WRONG mode to the new backend.
-    const [connection, activate] = await Promise.all([
-      resolveConnectionForProfile(target),
-      prepareGatewayForProfile(target)
-    ])
-
-    // ONE publication. batch() defers Nanostores' notifications to the end of
-    // the callback, so the active gateway, $activeGatewayProfile and
-    // $connection become visible together. Without it these are sequential
-    // .set() calls that each drain their listeners synchronously, and a
-    // $gateway listener runs while the other two still name the old backend.
-    batch(() => {
-      // A rejected activation publishes NOTHING, exactly like the agent path.
-      // applyActive() returns false when its captured epoch was superseded --
-      // a newer switch (or a teardown) landed while this one was awaiting its
-      // route or socket. Publishing the companions anyway would leave the
-      // CURRENT gateway paired with the stale profile pointer and descriptor,
-      // and batch() cannot rescue that: it would make the mismatched tuple
-      // atomically observable rather than prevent it.
-      if (!activate()) {
-        return
-      }
-
-      $activeGatewayProfile.set(target)
-
-      if (connection) {
-        setConnection(connection)
-      }
-    })
-  })().catch(() => {
-    // Descriptor lookup failed: the switch fails as a unit. Nothing was
-    // published, so every atom still consistently describes the previous
-    // profile; the user can retry the switch.
-  })
 
   try {
-    await gatewaySwitch
+    await occupySerializedSwitch(
+      gatewaySwitchLatch,
+      async () => {
+        // Resolve the target's connection descriptor and open (or reuse) its
+        // socket BEFORE anything is published — without closing the profile you
+        // came from. The gateway used to be activated (and the profile atom set)
+        // while the descriptor fetch was still in flight, so during that window
+        // $gateway already targeted the new backend while $connection still
+        // described the previous one — and any request or plugin mode-listener
+        // firing then announced the WRONG mode to the new backend.
+        const [connection, activate] = await Promise.all([
+          resolveConnectionForProfile(target),
+          prepareGatewayForProfile(target)
+        ])
+
+        // ONE publication. batch() defers Nanostores' notifications to the end of
+        // the callback, so the active gateway, $activeGatewayProfile and
+        // $connection become visible together. Without it these are sequential
+        // .set() calls that each drain their listeners synchronously, and a
+        // $gateway listener runs while the other two still name the old backend.
+        let activated = false
+        batch(() => {
+          // A rejected activation publishes NOTHING, exactly like the agent path.
+          // applyActive() returns false when its captured epoch was superseded --
+          // a newer switch (or a teardown) landed while this one was awaiting its
+          // route or socket. Publishing the companions anyway would leave the
+          // CURRENT gateway paired with the stale profile pointer and descriptor,
+          // and batch() cannot rescue that: it would make the mismatched tuple
+          // atomically observable rather than prevent it.
+          if (!activate()) {
+            return
+          }
+
+          activated = true
+          $activeGatewayProfile.set(target)
+
+          if (connection) {
+            setConnection(connection)
+          }
+        })
+
+        if (!activated) {
+          throw new Error('Gateway activation was superseded')
+        }
+      },
+      { onAbandon: abandonGatewaySwitch, timeoutMs: GATEWAY_SWITCH_TIMEOUT_MS }
+    )
   } finally {
-    gatewaySwitch = null
     $gatewaySwapTarget.set(null)
   }
 }
@@ -424,52 +452,62 @@ export async function ensureGatewayAgent(connectionId: null | string, profile: s
   }
 
   // Serialize against any in-flight profile/agent switch (shared mutex).
-  if (gatewaySwitch) {
-    await gatewaySwitch.catch(() => undefined)
+  if (gatewaySwitchLatch.pending) {
+    await awaitSerializedSwitch(gatewaySwitchLatch, GATEWAY_SWITCH_TIMEOUT_MS, {
+      onAbandon: abandonGatewaySwitch
+    })
   }
 
   $gatewaySwapTarget.set(target)
-  gatewaySwitch = (async () => {
-    // Dial the agent's socket and resolve its descriptor without publishing
-    // either, exactly like the profile path above. Activating first and then
-    // awaiting the descriptor left $gateway on the new backend while
-    // $connection still described the old one, so anything requesting during
-    // that window announced the WRONG mode to the new backend.
-    const [descriptor, activate] = await Promise.all([
-      resolveConnectionForActiveAgent(connection, target),
-      prepareGatewayForAgent(connection, target)
-    ])
-
-    // ONE publication. batch() defers Nanostores' notifications to the end of
-    // the callback, so a $gateway listener cannot run while the profile
-    // pointer and the connection descriptor still name the previous backend.
-    // Without it these are three sequential .set() calls, each draining its
-    // listeners synchronously, and the first listener observes exactly the
-    // mismatch this seam exists to prevent.
-    batch(() => {
-      // A disposed target (source edited/removed mid-dial) publishes nothing
-      // at all, rather than moving the profile pointer to a backend that no
-      // longer has a socket.
-      if (!activate()) {
-        return
-      }
-
-      $activeGatewayProfile.set(target)
-
-      // Remote-aware paths (image.attach_bytes vs image.attach, /api/fs/*,
-      // /api/media) follow $connection. Null here is only the no-bridge case,
-      // so keeping the previous descriptor is correct; a failed lookup
-      // rejected above and never reached this frame.
-      if (descriptor) {
-        setConnection(descriptor)
-      }
-    })
-  })()
 
   try {
-    await gatewaySwitch
+    await occupySerializedSwitch(
+      gatewaySwitchLatch,
+      async () => {
+        // Dial the agent's socket and resolve its descriptor without publishing
+        // either, exactly like the profile path above. Activating first and then
+        // awaiting the descriptor left $gateway on the new backend while
+        // $connection still described the old one, so anything requesting during
+        // that window announced the WRONG mode to the new backend.
+        const [descriptor, activate] = await Promise.all([
+          resolveConnectionForActiveAgent(connection, target),
+          prepareGatewayForAgent(connection, target)
+        ])
+
+        // ONE publication. batch() defers Nanostores' notifications to the end of
+        // the callback, so a $gateway listener cannot run while the profile
+        // pointer and the connection descriptor still name the previous backend.
+        // Without it these are three sequential .set() calls, each draining its
+        // listeners synchronously, and the first listener observes exactly the
+        // mismatch this seam exists to prevent.
+        let activated = false
+        batch(() => {
+          // A disposed target (source edited/removed mid-dial) publishes nothing
+          // at all, rather than moving the profile pointer to a backend that no
+          // longer has a socket.
+          if (!activate()) {
+            return
+          }
+
+          activated = true
+          $activeGatewayProfile.set(target)
+
+          // Remote-aware paths (image.attach_bytes vs image.attach, /api/fs/*,
+          // /api/media) follow $connection. Null here is only the no-bridge case,
+          // so keeping the previous descriptor is correct; a failed lookup
+          // rejected above and never reached this frame.
+          if (descriptor) {
+            setConnection(descriptor)
+          }
+        })
+
+        if (!activated) {
+          throw new Error('Gateway activation was superseded')
+        }
+      },
+      { onAbandon: abandonGatewaySwitch, timeoutMs: GATEWAY_SWITCH_TIMEOUT_MS }
+    )
   } finally {
-    gatewaySwitch = null
     $gatewaySwapTarget.set(null)
   }
 }
@@ -507,6 +545,16 @@ export const $profileScope = computed([$showAllProfiles, $activeGatewayProfile],
   showAll ? ALL_PROFILES : normalizeProfileKey(gateway)
 )
 
+// Fire-and-forget sibling of ensureGatewayProfile for rail / hotkey / wake
+// clicks. Failures must surface (toast) and must not latch the mutex — the
+// empty `.catch(() => {})` that used to live on the switch itself hid both
+// the error and, when the work hung, every later retry.
+export function requestGatewayProfile(profile: string): void {
+  void ensureGatewayProfile(profile).catch(error => {
+    notifyError(error, translateNow('profiles.failedSwitch'))
+  })
+}
+
 // Switch the active context to `name`: leave "All profiles" mode, point new
 // chats at it, and swap the single live gateway onto its backend (which moves
 // $activeGatewayProfile → name, so $profileScope follows).
@@ -522,7 +570,7 @@ export function selectProfile(name: string): void {
     requestFreshSession()
   }
 
-  void ensureGatewayProfile(target)
+  requestGatewayProfile(target)
 }
 
 // Start a fresh session in `name` WITHOUT collapsing the "All profiles" browse
@@ -535,7 +583,7 @@ export function newSessionInProfile(name: string): void {
   const target = normalizeProfileKey(name)
   $newChatProfile.set(target)
   requestFreshSession()
-  void ensureGatewayProfile(target)
+  requestGatewayProfile(target)
 }
 
 export function setShowAllProfiles(value: boolean): void {

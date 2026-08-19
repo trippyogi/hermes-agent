@@ -15,15 +15,18 @@ const ensureGatewayForProfile = vi.fn(async () => undefined)
 const prepareGatewayForAgent = vi.fn(async (_connectionId: null | string, _profile: string) => activateGateway)
 const prepareGatewayForProfile = vi.fn(async (_profile: string) => activateGateway)
 const openGatewayForProfile = vi.fn(async (_profile: string) => undefined)
+const supersedeGatewayActivation = vi.fn()
 const $gateway = atom<unknown>({ id: 'live-socket' })
 const resetStarmapGraph = vi.fn()
+const notifyError = vi.fn()
 
 vi.mock('@/store/gateway', () => ({
   $gateway,
   ensureGatewayForProfile,
   openGatewayForProfile,
   prepareGatewayForAgent,
-  prepareGatewayForProfile
+  prepareGatewayForProfile,
+  supersedeGatewayActivation
 }))
 vi.mock('@/hermes', () => ({
   getProfiles: vi.fn(async () => ({ profiles: [] })),
@@ -31,15 +34,21 @@ vi.mock('@/hermes', () => ({
 }))
 vi.mock('@/lib/query-client', () => ({ invalidateProfileScopedQueries: vi.fn() }))
 vi.mock('@/store/starmap', () => ({ resetStarmapGraph }))
+vi.mock('@/store/notifications', () => ({ notifyError }))
+vi.mock('@/i18n', () => ({ translateNow: (key: string) => key }))
 
 const {
   $activeGatewayProfile,
   $profiles,
   ensureGatewayProfile,
+  GATEWAY_SWITCH_TIMEOUT_MS,
   invalidateProfileListFetches,
   prewarmProfileBackend,
-  refreshProfiles
+  refreshProfiles,
+  requestGatewayProfile
 } = await import('./profile')
+
+const { GatewaySwitchTimeoutError } = await import('./serialized-switch')
 
 const { $connection } = await import('./session')
 const { invalidateProfileScopedQueries } = await import('@/lib/query-client')
@@ -68,7 +77,10 @@ beforeEach(() => {
   activateGateway.mockClear()
   ensureGatewayForProfile.mockClear()
   prepareGatewayForProfile.mockClear()
+  prepareGatewayForProfile.mockResolvedValue(activateGateway)
   openGatewayForProfile.mockClear()
+  supersedeGatewayActivation.mockClear()
+  notifyError.mockClear()
   $gateway.set({ id: 'live-socket' })
   $activeGatewayProfile.set('default')
   $connection.set(localConn())
@@ -79,6 +91,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  vi.useRealTimers()
   vi.unstubAllGlobals()
   $connection.set(null)
 })
@@ -119,7 +132,7 @@ describe('ensureGatewayProfile → $connection sync (#46651)', () => {
     // describes the previous profile and the user can retry.
     getConnection.mockRejectedValue(new Error('backend unreachable'))
 
-    await ensureGatewayProfile('vps-remote')
+    await expect(ensureGatewayProfile('vps-remote')).rejects.toThrow('backend unreachable')
 
     expect(activateGateway).not.toHaveBeenCalled()
     expect($activeGatewayProfile.get()).toBe('default')
@@ -154,6 +167,46 @@ describe('ensureGatewayProfile → $connection sync (#46651)', () => {
     expect(activateGateway).toHaveBeenCalledTimes(1)
     expect($activeGatewayProfile.get()).toBe('vps-remote')
     expect($connection.get()?.mode).toBe('remote')
+  })
+
+  it('does not latch later switches when the first switch never settles (#89586)', async () => {
+    // Module-global pending promise + swallowed hang: one never-settling
+    // Promise.all left every later ensureGatewayProfile awaiting the same
+    // occupant. The rail looked dead until Desktop restarted.
+    vi.useFakeTimers()
+    getConnection.mockReturnValue(new Promise<HermesConnection>(() => undefined))
+    prepareGatewayForProfile.mockReturnValue(new Promise<() => boolean>(() => undefined))
+
+    const hung = ensureGatewayProfile('architect')
+    const hungResult = expect(hung).rejects.toBeInstanceOf(GatewaySwitchTimeoutError)
+    await vi.advanceTimersByTimeAsync(GATEWAY_SWITCH_TIMEOUT_MS)
+    await hungResult
+
+    expect($activeGatewayProfile.get()).toBe('default')
+    expect(supersedeGatewayActivation).toHaveBeenCalled()
+
+    prepareGatewayForProfile.mockResolvedValue(activateGateway)
+    getConnection.mockResolvedValue(localConn({ profile: 'coder' }))
+
+    await ensureGatewayProfile('coder')
+
+    expect($activeGatewayProfile.get()).toBe('coder')
+    expect($connection.get()?.profile).toBe('coder')
+    vi.useRealTimers()
+  })
+
+  it('surfaces a fire-and-forget rail click failure so the user can retry', async () => {
+    getConnection.mockRejectedValue(new Error('backend unreachable'))
+
+    requestGatewayProfile('architect')
+    await vi.waitFor(() => expect(notifyError).toHaveBeenCalled())
+
+    expect(notifyError).toHaveBeenCalledWith(expect.any(Error), 'profiles.failedSwitch')
+    expect($activeGatewayProfile.get()).toBe('default')
+
+    getConnection.mockResolvedValue(localConn({ profile: 'architect' }))
+    await ensureGatewayProfile('architect')
+    expect($activeGatewayProfile.get()).toBe('architect')
   })
 
   it('does not churn $connection when the target is already the active profile', async () => {

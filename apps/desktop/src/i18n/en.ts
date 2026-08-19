@@ -1759,6 +1759,7 @@ export const en: Translations = {
     exported: 'Profile exported',
     failedImport: 'Failed to import profile',
     failedExport: 'Failed to export profile',
+    failedSwitch: 'Couldn’t switch profile',
     allProfiles: 'All profiles',
     showAllProfiles: 'Show all profiles',
     switchToProfile: name => `Switch to ${name}`,

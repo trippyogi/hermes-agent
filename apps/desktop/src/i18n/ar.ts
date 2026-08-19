@@ -1348,6 +1348,7 @@ export const ar = defineLocale({
     exported: 'تم تصدير الملف الشخصي',
     failedImport: 'فشل استيراد الملف الشخصي',
     failedExport: 'فشل تصدير الملف الشخصي',
+    failedSwitch: 'فشل تبديل الملف الشخصي',
     allProfiles: 'كل الملفات الشخصية',
     showAllProfiles: 'إظهار كل الملفات الشخصية',
     switchToProfile: name => `التبديل إلى ${name}`,

@@ -1477,6 +1477,7 @@ export const ja = defineLocale({
     exported: 'プロファイルをエクスポートしました',
     failedImport: 'プロファイルのインポートに失敗しました',
     failedExport: 'プロファイルのエクスポートに失敗しました',
+    failedSwitch: 'プロファイルの切り替えに失敗しました',
     allProfiles: 'すべてのプロファイル',
     showAllProfiles: 'すべてのプロファイルを表示',
     switchToProfile: name => `${name} に切り替え`,

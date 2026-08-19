@@ -42,10 +42,10 @@ import {
   $freshSessionRequest,
   $profileScope,
   ALL_PROFILES,
-  ensureGatewayProfile,
   newSessionInProfile,
   normalizeProfileKey,
-  refreshActiveProfile
+  refreshActiveProfile,
+  requestGatewayProfile
 } from '@/store/profile'
 import { $startWorkSessionRequest, followActiveSessionCwd } from '@/store/projects'
 import {
@@ -725,7 +725,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
           if (payload?.start_new_session !== false) {
             newSessionInProfile(targetProfile)
           } else {
-            void ensureGatewayProfile(normalizeProfileKey(targetProfile))
+            requestGatewayProfile(normalizeProfileKey(targetProfile))
           }
         } else if (payload?.start_new_session !== false) {
           startFreshSessionDraft()

@@ -1423,6 +1423,7 @@ export const zhHant = defineLocale({
     exported: '設定檔已匯出',
     failedImport: '匯入設定檔失敗',
     failedExport: '匯出設定檔失敗',
+    failedSwitch: '切換設定檔失敗',
     allProfiles: '全部設定檔',
     showAllProfiles: '顯示全部設定檔',
     switchToProfile: name => `切換至 ${name}`,
