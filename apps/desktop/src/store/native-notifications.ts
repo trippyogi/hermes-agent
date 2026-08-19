@@ -199,7 +199,13 @@ export async function respondToApprovalAction(sessionId: null | string, actionId
   }
 
   try {
-    await gateway.request('approval.respond', { choice, session_id: sessionId ?? undefined })
+    const result = await gateway.request<{ resolved?: boolean | number }>('approval.respond', {
+      choice,
+      session_id: sessionId ?? undefined
+    })
+    if (!result?.resolved) {
+      return
+    }
     clearApprovalRequest(sessionId)
   } catch {
     // Leave the prompt parked so the user can still resolve it in-app.

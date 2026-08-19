@@ -807,10 +807,7 @@ def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") ->
         return
     _finalize_session(session, end_reason=end_reason)
     try:
-        from tools.approval import unregister_gateway_notify
-
-        if key := session.get("session_key"):
-            unregister_gateway_notify(key)
+        _unregister_session_approval_notifiers(session)
     except Exception:
         pass
     try:
@@ -4517,13 +4514,17 @@ def _sync_session_key_after_compress(
             enable_session_yolo,
             is_session_yolo_enabled,
             register_gateway_notify,
-            unregister_gateway_notify,
         )
 
-        try:
-            unregister_gateway_notify(old_key)
-        except Exception:
-            pass
+        aliases = [
+            str(k)
+            for k in (session.get("session_key_aliases") or [])
+            if str(k or "").strip()
+        ]
+        for key in (old_key, new_session_id):
+            if key and key not in aliases:
+                aliases.append(key)
+        session["session_key_aliases"] = aliases
         session["session_key"] = new_session_id
         try:
             yolo_was_on = is_session_yolo_enabled(old_key)
@@ -7472,6 +7473,64 @@ def _find_live_session_by_key(session_key: str) -> tuple[str, dict] | None:
         if _session_lookup_key(session, fallback=sid) == session_key:
             return sid, session
     return None
+
+
+def _resolve_session_ref(session_id: str) -> tuple[str, dict] | None:
+    """Resolve a client session_id to ``(live_sid, session)``.
+
+    Desktop remote clients routinely send the durable ``stored_session_id``
+    (or a post-compress continuation id) rather than the live UI sid that
+    keys ``_sessions``. ``session.resume`` already falls back through
+    ``_find_live_session_by_key``; approval/interrupt must do the same or
+    Approve/Stop land on 4001 while the agent stays blocked.
+    """
+    raw = str(session_id or "").strip()
+    if not raw:
+        return None
+    session = _sessions.get(raw)
+    if session is not None and not session.get("_finalized"):
+        return raw, session
+    for sid, session in list(_sessions.items()):
+        if session.get("_finalized"):
+            continue
+        aliases = {
+            str(session.get("session_key") or ""),
+            str(getattr(session.get("agent"), "session_id", None) or ""),
+            _session_lookup_key(session, fallback=sid),
+            *(str(k) for k in (session.get("session_key_aliases") or []) if k),
+        }
+        if raw in aliases:
+            return sid, session
+    return None
+
+
+def _approval_queue_keys(session: dict, client_session_id: str = "") -> list[str]:
+    """Session-key aliases that may own a pending ``_gateway_queues`` entry.
+
+    The turn binds ``set_current_session_key(session["session_key"])`` at
+    start; compression can rotate ``agent.session_id`` / ``session_key``
+    while an approval is already queued under the old key. Try every
+    known identity so a correctly routed click is not dropped.
+    """
+    keys: list[str] = []
+    for candidate in (
+        session.get("session_key"),
+        getattr(session.get("agent"), "session_id", None),
+        *(session.get("session_key_aliases") or []),
+        client_session_id,
+    ):
+        key = str(candidate or "").strip()
+        if key and key not in keys:
+            keys.append(key)
+    return keys
+
+
+def _unregister_session_approval_notifiers(session: dict) -> None:
+    """Drop notify callbacks for every identity this session has used."""
+    from tools.approval import unregister_gateway_notify
+
+    for key in _approval_queue_keys(session):
+        unregister_gateway_notify(key)
 
 
 def _fallback_session_info(session: dict) -> dict:

@@ -101,6 +101,20 @@ describe('PendingToolApproval', () => {
     expect(screen.getByText(longCommand)).toBeTruthy()
   })
 
+  it('keeps the prompt when approval.respond reports resolved: 0', async () => {
+    const request = vi.fn().mockResolvedValue({ resolved: 0 })
+    $gateway.set({ request } as unknown as HermesGateway)
+    setRequest()
+    render(<PendingToolApproval part={part('terminal')} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /Run/ }))
+
+    await waitFor(() => {
+      expect(request).toHaveBeenCalled()
+    })
+    expect($approvalRequest.get()).not.toBeNull()
+  })
+
   it('sends choice "deny" on Reject', async () => {
     const request = mockGateway()
     setRequest()

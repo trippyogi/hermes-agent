@@ -23,7 +23,7 @@ import logging
 from typing import Any, Callable, Dict, Optional, Tuple, cast
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from gateway.relay.descriptor import CapabilityDescriptor
 from gateway.relay.media import RelayMediaClient
 from gateway.relay.transport import RelayTransport
@@ -1845,11 +1845,19 @@ class RelayAdapter(BasePlatformAdapter):
             return False
         state = self._pop_prompt(prompt_id)
         if state is None:
-            logger.info(
+            # `/once` is not a registered slash command, so Guard 1 queues it
+            # behind the agent that is blocked on this approval. Rewrite onto
+            # `/approve` / `/deny` — those bypass both busy-session guards.
+            rewritten = self._approval_option_command_text(option_id)
+            if rewritten:
+                event.text = rewritten
+                event.message_type = MessageType.COMMAND
+            logger.warning(
                 "relay prompt_response for unknown/expired prompt %s (option=%s) — "
-                "falling through to text dispatch",
+                "falling through to text dispatch as %r",
                 prompt_id,
                 option_id,
+                getattr(event, "text", ""),
             )
             return False
 
@@ -1941,6 +1949,18 @@ class RelayAdapter(BasePlatformAdapter):
         except Exception:  # noqa: BLE001 - a resolver failure must not kill the reader
             logger.warning("relay prompt_response resolution failed", exc_info=True)
         return True
+
+    @staticmethod
+    def _approval_option_command_text(option_id: str) -> str:
+        """Map a prompt option onto the /approve /deny commands that bypass
+        both busy-session guards. ``/once`` is not a registered command.
+        """
+        return {
+            "once": "/approve",
+            "session": "/approve session",
+            "always": "/approve always",
+            "deny": "/deny",
+        }.get(str(option_id or ""), "")
 
     def _prompt_reply_metadata(self, event) -> Dict[str, Any]:
         """Thread/topic metadata so prompt acks land where the prompt lives."""

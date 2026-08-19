@@ -169,6 +169,26 @@ async def test_clarify_renders_choices_plus_other_with_positional_ids():
 
 
 @pytest.mark.asyncio
+async def test_expired_prompt_response_rewrites_once_to_approve():
+    """`/once` is not a registered slash command, so Guard 1 would queue it
+    behind the agent blocked on this approval. Rewrite onto `/approve`.
+    """
+    adapter, _stub = _adapter()
+    event = _event({"prompt_id": "deadbeef", "option_id": "once"}, text="/once")
+    assert await adapter._consume_prompt_response(event) is False
+    assert event.text == "/approve"
+    assert event.message_type == MessageType.COMMAND
+
+
+@pytest.mark.asyncio
+async def test_expired_prompt_response_rewrites_empty_text_deny():
+    adapter, _stub = _adapter()
+    event = _event({"prompt_id": "deadbeef", "option_id": "deny"}, text="")
+    assert await adapter._consume_prompt_response(event) is False
+    assert event.text == "/deny"
+
+
+@pytest.mark.asyncio
 async def test_prompt_response_resolves_clarify_choice_and_other(monkeypatch):
     adapter, stub = _adapter()
     await adapter.send_clarify("c1", "Which?", ["alpha", "beta"], "cl-9", "s")

@@ -863,22 +863,42 @@ def _(rid, params: dict) -> dict:
 
 @method("approval.respond")
 def _(rid, params: dict) -> dict:
-    session, err = _sess(params, rid)
-    if err:
-        return err
+    # Do not use _sess() here: that helper keys _sessions by the live UI sid
+    # only, then would _start_agent_build under a durable id. Remote desktop
+    # clients send stored_session_id / continuation ids (AGENTS.md identity
+    # rule). Resolve the live row, then try every session-key alias against
+    # the approval queue. A zero-resolve must error — a 200 {resolved: 0}
+    # made the desktop clear the bar while the agent kept waiting.
+    client_sid = str(params.get("session_id") or "").strip()
+    ref = _resolve_session_ref(client_sid)
+    if ref is None:
+        logger.warning(
+            "approval.respond session not found session_id=%s",
+            client_sid or "<empty>",
+        )
+        return _err(rid, 4001, "session not found")
+    _live_sid, session = ref
     try:
         from tools.approval import resolve_gateway_approval
 
-        return _ok(
-            rid,
-            {
-                "resolved": resolve_gateway_approval(
-                    session["session_key"],
-                    params.get("choice", "deny"),
-                    resolve_all=params.get("all", False),
-                )
-            },
-        )
+        choice = params.get("choice", "deny")
+        resolve_all = params.get("all", False)
+        count = 0
+        tried = _approval_queue_keys(session, client_sid)
+        for key in tried:
+            count = resolve_gateway_approval(key, choice, resolve_all=resolve_all)
+            if count:
+                break
+        if not count:
+            logger.warning(
+                "approval.respond matched live_sid=%s but no pending approval "
+                "(tried keys=%s choice=%s)",
+                _live_sid,
+                tried,
+                choice,
+            )
+            return _err(rid, 4010, "no pending approval for this session")
+        return _ok(rid, {"resolved": count})
     except Exception as e:
         return _err(rid, 5004, str(e))
 

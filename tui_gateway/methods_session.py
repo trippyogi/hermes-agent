@@ -2708,11 +2708,12 @@ def _(rid, params: dict) -> dict:
     # Keypress barge-in: stopping the turn also silences its streaming TTS
     # (voice is process-global, so no per-session scoping is needed).
     _tts_stream_stop()
-    session, err = _sess_nowait(params, rid)
-    if err:
-        return err
+    client_sid = str(params.get("session_id") or "")
+    ref = _resolve_session_ref(client_sid)
+    if ref is None:
+        return _err(rid, 4001, "session not found")
+    sid, session = ref
     if _session_uses_compute_host(session):
-        sid = str(params.get("session_id") or "")
         if session.get("running"):
             try:
                 _get_compute_host_supervisor().interrupt(sid, request_id=f"interrupt-{rid}")
@@ -2725,11 +2726,14 @@ def _(rid, params: dict) -> dict:
         try:
             from tools.approval import resolve_gateway_approval
 
-            resolve_gateway_approval(session["session_key"], "deny", resolve_all=True)
+            for key in _approval_queue_keys(session, client_sid):
+                if resolve_gateway_approval(key, "deny", resolve_all=True):
+                    break
         except Exception:
             pass
         return _ok(rid, {"status": "interrupted", "turn_isolation": True})
-    session, err = _sess(params, rid)
+    _start_agent_build(sid, session)
+    err = _wait_agent(session, rid)
     if err:
         return err
     # Safety net: if the turn's run thread is already gone but `running` stayed
@@ -2761,11 +2765,13 @@ def _(rid, params: dict) -> dict:
     # _clear_pending() would collaterally cancel clarify/sudo/secret
     # prompts on unrelated sessions sharing the same tui_gateway
     # process, silently resolving them to empty strings.
-    _clear_pending(params.get("session_id", ""))
+    _clear_pending(sid)
     try:
         from tools.approval import resolve_gateway_approval
 
-        resolve_gateway_approval(session["session_key"], "deny", resolve_all=True)
+        for key in _approval_queue_keys(session, client_sid):
+            if resolve_gateway_approval(key, "deny", resolve_all=True):
+                break
     except Exception:
         pass
     return _ok(rid, {"status": "interrupted"})

@@ -218,6 +218,16 @@ describe('respondToApprovalAction', () => {
     expect($approvalRequest.get()).toBeNull()
   })
 
+  it('leaves the prompt parked when approval.respond reports resolved: 0', async () => {
+    request.mockResolvedValueOnce({ resolved: 0 })
+    setActiveSessionId('bg')
+    setApprovalRequest({ command: 'rm -rf /', description: 'dangerous', sessionId: 'bg' })
+
+    await respondToApprovalAction('bg', 'approve')
+
+    expect($approvalRequest.get()?.sessionId).toBe('bg')
+  })
+
   it('rejects via approval.respond {choice: "deny"}', async () => {
     await respondToApprovalAction('bg', 'reject')
     expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'deny', session_id: 'bg' })

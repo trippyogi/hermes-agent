@@ -142,10 +142,16 @@ const ApprovalBar: FC<{ request: ApprovalRequest; surface: 'floating' | 'inline'
       setSubmitting(choice)
 
       try {
-        await gateway.request<{ resolved?: boolean }>('approval.respond', {
+        const result = await gateway.request<{ resolved?: boolean | number }>('approval.respond', {
           choice,
           session_id: request.sessionId ?? undefined
         })
+        // Older backends returned {resolved: 0} on a session-key miss; the
+        // click looked successful while the agent kept waiting. Keep the bar
+        // up so the user can retry (newer backends error instead).
+        if (!result?.resolved) {
+          throw new Error(copy.sendFailed)
+        }
         triggerHaptic(choice === 'deny' ? 'cancel' : 'submit')
         clearApprovalRequest(request.sessionId)
       } catch (error) {

@@ -2182,15 +2182,19 @@ def register_gateway_notify(session_key: str, cb) -> None:
         _gateway_notify_cbs[session_key] = cb
 
 
-def unregister_gateway_notify(session_key: str) -> None:
+def unregister_gateway_notify(session_key: str, *, release_pending: bool = True) -> None:
     """Unregister the per-session gateway approval callback.
 
     Signals ALL blocked threads for this session so they don't hang forever
     (e.g. when the agent run finishes or is interrupted).
+
+    ``release_pending=False`` drops only the notify callback — used when
+    re-anchoring a session_key mid-turn (context compression) so an
+    already-queued approval is not silently released as a timeout.
     """
     with _lock:
         _gateway_notify_cbs.pop(session_key, None)
-        entries = _gateway_queues.pop(session_key, [])
+        entries = _gateway_queues.pop(session_key, []) if release_pending else []
     for entry in entries:
         entry.event.set()
 
