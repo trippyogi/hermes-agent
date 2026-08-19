@@ -50,7 +50,7 @@ function editorFromConnection(conn: DesktopRegistryConnection): EditorState {
     kind: conn.kind,
     label: conn.label,
     url: conn.url || '',
-    authMode: conn.authMode || 'token',
+    authMode: conn.kind === 'cloud' ? 'oauth' : conn.authMode || 'token',
     token: '',
     // Reconstruct the composite the single ssh host field displays. The save
     // payload sends ONLY this string (never separate user/port), because
@@ -70,7 +70,7 @@ function emptyEditor(kind: DesktopConnectionKind): EditorState {
     kind,
     label: '',
     url: '',
-    authMode: 'token',
+    authMode: kind === 'cloud' ? 'oauth' : 'token',
     token: '',
     host: '',
     keyPath: '',
@@ -282,9 +282,9 @@ export function ConnectionsRegistrySection() {
 
         if (editor.kind === 'remote' || editor.kind === 'cloud') {
           payload.url = editor.url
-          payload.authMode = editor.authMode
+          payload.authMode = editor.kind === 'cloud' ? 'oauth' : editor.authMode
 
-          if (editor.token.trim()) {
+          if (editor.kind === 'remote' && editor.authMode === 'token' && editor.token.trim()) {
             payload.token = editor.token.trim()
           }
 
@@ -546,7 +546,11 @@ export function ConnectionsRegistrySection() {
                 key={kind}
                 onClick={() => {
                   setDupeError(null)
-                  setEditor({ ...editor, kind })
+                  setEditor({
+                    ...editor,
+                    authMode: kind === 'cloud' ? 'oauth' : editor.authMode,
+                    kind
+                  })
                 }}
                 size="sm"
                 variant={editor.kind === kind ? 'default' : 'outline'}

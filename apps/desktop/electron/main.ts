@@ -102,14 +102,17 @@ import {
   connectionDialFieldsChanged,
   mergeConnectionInput,
   migrateV1ToRegistry,
+  missingRegistrySessionTokenError,
   normalizeConnectionInput,
   normalizeRegistry,
   rememberSshEnumeration,
   removeConnection,
   resolveRegistryLocalRoute,
+  resolveRegistrySourceAuthMode,
   setPrimaryConnection,
   shouldDeferLocalEnumeration,
   shouldRetrySshInventory,
+  syncCloudOauthConnection,
   updateEligibility,
   upsertConnection
 } from './connection-registry'
@@ -8390,6 +8393,25 @@ function writeDesktopConnectionsRegistry(registry) {
 }
 
 /**
+ * After a v1 Cloud login/save, copy the authenticated source into the v2
+ * registry as `kind: cloud` / `authMode: oauth` without flipping primary and
+ * without storing a one-time ticket. Global Cloud apply used to update only
+ * connection.json, leaving a token-mode secondary that Test could not use.
+ */
+function persistCloudOauthRegistrySource(config, profileKey = null) {
+  const block = profileKey ? config?.profiles?.[profileKey] : config?.remote
+  const mode = profileKey ? block?.mode : config?.mode
+
+  if (mode !== 'cloud' || !block?.url) {
+    return
+  }
+
+  writeDesktopConnectionsRegistry(
+    syncCloudOauthConnection(readDesktopConnectionsRegistry(), { url: block.url, org: block.org })
+  )
+}
+
+/**
  * Renderer-facing view of a registry entry: token bytes never cross the IPC
  * boundary — the renderer gets a preview + set flag, mirroring
  * sanitizeDesktopConnectionConfig.
@@ -8446,12 +8468,23 @@ function sanitizeConnectionsRegistry(registry = readDesktopConnectionsRegistry()
 async function saveRegistryConnection(input: any = {}) {
   const registry = readDesktopConnectionsRegistry()
   const existing = input.id ? registry.connections.find(c => c.id === input.id) : null
-  const incomingToken = typeof input.token === 'string' ? input.token.trim() : ''
+
+  // Cloud sources authenticate via the portal/native session, not a pasted
+  // token. Never run the incoming value through encryptDesktopSecret: on a
+  // keyring-less machine that throw is exactly "Secure token storage is
+  // unavailable (no OS keyring service was found)", and normalize would drop
+  // the envelope anyway.
+  const incomingToken =
+    input.kind === 'cloud' || existing?.kind === 'cloud'
+      ? ''
+      : typeof input.token === 'string'
+        ? input.token.trim()
+        : ''
 
   const token = resolvePersistedRemoteToken({
     incomingToken,
     persistToken: true,
-    existingToken: existing?.token,
+    existingToken: input.kind === 'cloud' || existing?.kind === 'cloud' ? undefined : existing?.token,
     allowPlainText: input.allowPlainTextToken,
     encryptSecret: encryptDesktopSecret
   })
@@ -9964,11 +9997,17 @@ async function connectRegistryBackend(source, profile, key, poolEntry) {
   // remote / cloud: one gateway host serves every profile of that source,
   // scoped per request — the descriptor carries the profile + connectionId so
   // renderer-side WS minting and REST scoping target the right agent.
-  const token = source.authMode === 'oauth' ? null : decryptDesktopSecret(source.token)
+  const authMode = resolveRegistrySourceAuthMode(source)
+  const token = authMode === 'oauth' ? null : decryptDesktopSecret(source.token)
+  const missingToken = missingRegistrySessionTokenError(source, Boolean(token))
+
+  if (missingToken) {
+    throw new Error(missingToken)
+  }
 
   const connection = await buildRemoteConnection(
     source.url,
-    normAuthMode(source.authMode),
+    authMode,
     token,
     `registry:${source.id}`,
     undefined,
@@ -12696,15 +12735,17 @@ ipcMain.handle('hermes:connections:test', async (_event, id) => {
     authMode = normAuthMode(local.authMode)
   } else {
     baseUrl = normalizeRemoteBaseUrl(entry.url)
-    authMode = normAuthMode(entry.authMode)
+    authMode = resolveRegistrySourceAuthMode(entry)
     testHeaders = decryptRemoteHeaders(entry.headers)
 
     if (authMode !== 'oauth') {
       token = decryptDesktopSecret(entry.token)
+    }
 
-      if (!token) {
-        throw new Error('This connection has no saved session token. Edit the connection and paste one.')
-      }
+    const missingToken = missingRegistrySessionTokenError(entry, Boolean(token))
+
+    if (missingToken) {
+      throw new Error(missingToken)
     }
   }
 
@@ -13172,12 +13213,14 @@ ipcMain.handle('hermes:cloud:agent-sign-in', async (_event, dashboardUrl) => {
 ipcMain.handle('hermes:connection-config:save', async (_event, payload) => {
   const config = coerceDesktopConnectionConfig(payload)
   writeDesktopConnectionConfig(config)
+  persistCloudOauthRegistrySource(config, connectionScopeKey(payload?.profile))
 
   return sanitizeDesktopConnectionConfig(config, payload?.profile)
 })
 ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => {
   const config = coerceDesktopConnectionConfig(payload)
   writeDesktopConnectionConfig(config)
+  persistCloudOauthRegistrySource(config, connectionScopeKey(payload?.profile))
 
   const key = connectionScopeKey(payload?.profile)
   const scope = key || ''

@@ -22,6 +22,8 @@ import {
   LOCAL_CONNECTION_ID,
   mergeConnectionInput,
   migrateV1ToRegistry,
+  MISSING_REGISTRY_SESSION_TOKEN,
+  missingRegistrySessionTokenError,
   normalizeConnectionInput,
   normalizeRegistry,
   parseRemoteProfileListing,
@@ -29,9 +31,11 @@ import {
   rememberSshEnumeration,
   removeConnection,
   resolveRegistryLocalRoute,
+  resolveRegistrySourceAuthMode,
   setPrimaryConnection,
   shouldDeferLocalEnumeration,
   shouldRetrySshInventory,
+  syncCloudOauthConnection,
   uniqueLabel,
   updateEligibility,
   upsertConnection
@@ -619,6 +623,46 @@ test('remote input normalizes URL and auth mode; cloud keeps org', () => {
   assert.equal(cloud.authMode, 'oauth')
 })
 
+test('cloud input always persists as oauth and drops any token envelope', () => {
+  const registry = emptyRegistry()
+
+  for (const authMode of [undefined, 'token', 'weird', 'oauth']) {
+    const cloud = normalizeConnectionInput(
+      {
+        kind: 'cloud',
+        label: `Cloud ${String(authMode)}`,
+        url: `https://${String(authMode || 'none')}.hermes.cloud`,
+        authMode,
+        token: { encoding: 'plain', value: 'must-not-persist' }
+      },
+      registry
+    )
+
+    assert.equal(cloud.authMode, 'oauth', `authMode ${String(authMode)} must become oauth`)
+    assert.equal(cloud.token, undefined)
+  }
+})
+
+test('cloud Test/dial does not require a pasted session token', () => {
+  const cloudToken = { authMode: 'token' as const, kind: 'cloud' as const }
+  const cloudOauth = { authMode: 'oauth' as const, kind: 'cloud' as const }
+  const remoteToken = { authMode: 'token' as const, kind: 'remote' as const }
+  const remoteOauth = { authMode: 'oauth' as const, kind: 'remote' as const }
+
+  assert.equal(resolveRegistrySourceAuthMode(cloudToken), 'oauth')
+  assert.equal(resolveRegistrySourceAuthMode(cloudOauth), 'oauth')
+  assert.equal(resolveRegistrySourceAuthMode(remoteToken), 'token')
+  assert.equal(resolveRegistrySourceAuthMode(remoteOauth), 'oauth')
+
+  // Keyring-unavailable macOS still has an OAuth cookie/native session; Test
+  // must not demand a pasted token (and must not copy a one-time WS ticket).
+  assert.equal(missingRegistrySessionTokenError(cloudToken, false), null)
+  assert.equal(missingRegistrySessionTokenError(cloudOauth, false), null)
+  assert.equal(missingRegistrySessionTokenError(remoteOauth, false), null)
+  assert.equal(missingRegistrySessionTokenError(remoteToken, true), null)
+  assert.equal(missingRegistrySessionTokenError(remoteToken, false), MISSING_REGISTRY_SESSION_TOKEN)
+})
+
 test('ssh input requires a host; local input only carries the label', () => {
   const registry = emptyRegistry()
 
@@ -743,6 +787,98 @@ test('migrate: v1 cloud keeps cloud provenance + org', () => {
   assert.ok(cloud)
   assert.equal(registry.primary, cloud.id)
   assert.equal(cloud.org, 'nous')
+  assert.equal(cloud.authMode, 'oauth')
+})
+
+test('migrate: v1 cloud token-mode still becomes oauth without copying the token', () => {
+  const registry = migrateV1ToRegistry({
+    mode: 'cloud',
+    remote: { url: 'https://a.hermes.cloud', authMode: 'token', token: { encoding: 'plain', value: 'ticket' } }
+  })
+
+  const cloud = registry.connections.find(c => c.kind === 'cloud')
+
+  assert.ok(cloud)
+  assert.equal(cloud.authMode, 'oauth')
+  assert.equal(cloud.token, undefined)
+})
+
+test('normalizeRegistry coerces a stored token-mode cloud source to oauth', () => {
+  const registry = normalizeRegistry({
+    version: 2,
+    primary: 'local',
+    connections: [
+      { id: 'local', kind: 'local', label: 'This device' },
+      {
+        id: 'cloud-1',
+        kind: 'cloud',
+        label: 'Hermes Cloud',
+        url: 'https://a.hermes.cloud',
+        authMode: 'token',
+        token: { encoding: 'plain', value: 'must-not-keep' }
+      }
+    ]
+  })
+
+  const cloud = registry.connections.find(c => c.kind === 'cloud')
+
+  assert.ok(cloud)
+  assert.equal(cloud.authMode, 'oauth')
+  assert.equal(cloud.token, undefined)
+  assert.equal(registry.primary, LOCAL_CONNECTION_ID)
+})
+
+test('syncCloudOauthConnection upgrades a token-mode secondary without flipping primary', () => {
+  let registry = emptyRegistry()
+  registry = upsertConnection(
+    registry,
+    normalizeConnectionInput(
+      {
+        kind: 'cloud',
+        label: 'Hermes Cloud',
+        url: 'https://a.hermes.cloud',
+        authMode: 'token'
+      },
+      registry
+    )
+  )
+
+  // Simulate a pre-fix disk row that still says token and has no secret.
+  const stale = registry.connections.find(c => c.kind === 'cloud')
+  assert.ok(stale)
+  stale.authMode = 'token'
+  delete stale.token
+
+  const synced = syncCloudOauthConnection(registry, { url: 'https://a.hermes.cloud/', org: 'nous' })
+  const cloud = synced.connections.find(c => c.kind === 'cloud')
+
+  assert.ok(cloud)
+  assert.equal(synced.primary, LOCAL_CONNECTION_ID)
+  assert.equal(cloud.id, stale.id)
+  assert.equal(cloud.label, 'Hermes Cloud')
+  assert.equal(cloud.authMode, 'oauth')
+  assert.equal(cloud.org, 'nous')
+  assert.equal(cloud.token, undefined)
+})
+
+test('syncCloudOauthConnection appends a missing Cloud source and leaves local primary', () => {
+  const registry = emptyRegistry()
+  const synced = syncCloudOauthConnection(registry, { url: 'https://a.hermes.cloud', org: 'nous' })
+  const cloud = synced.connections.find(c => c.kind === 'cloud')
+
+  assert.ok(cloud)
+  assert.equal(synced.primary, LOCAL_CONNECTION_ID)
+  assert.equal(cloud.authMode, 'oauth')
+  assert.equal(cloud.token, undefined)
+  assert.equal(cloud.org, 'nous')
+  assert.equal(synced.connections.some(c => c.kind === 'local'), true)
+})
+
+test('syncCloudOauthConnection ignores a bad URL and never invents a token', () => {
+  const registry = emptyRegistry()
+
+  assert.equal(syncCloudOauthConnection(registry, { url: '' }), registry)
+  assert.equal(syncCloudOauthConnection(registry, { url: '   ' }), registry)
 })
 
 test('migrate: per-profile overrides become extra sources, deduped by URL', () => {

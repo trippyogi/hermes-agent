@@ -40,6 +40,12 @@ export const REGISTRY_VERSION = 2
 
 export const LOCAL_CONNECTION_ID = 'local'
 
+/** Exact Test-button copy when a token-auth remote has no persisted secret.
+ * Cloud / OAuth sources must never surface this — they authenticate via the
+ * portal/native session (cookies or RFC 8252 bearer), not a pasted token. */
+export const MISSING_REGISTRY_SESSION_TOKEN =
+  'This connection has no saved session token. Edit the connection and paste one.'
+
 /** Connection kinds. 'cloud' is remote-shaped (see modeIsRemoteLike) but keeps
  * its provenance so the UI can render the right card and updates can skip
  * platform-managed instances. */
@@ -458,6 +464,131 @@ export function updateEligibility(connection: RegistryConnection): UpdateEligibi
   return { eligible: true }
 }
 
+/** Dedupe key for remote/cloud gateway URLs. Trailing slashes and case drop. */
+function gatewayUrlKey(url: string): string {
+  return String(url || '')
+    .trim()
+    .replace(/\/+$/, '')
+    .toLowerCase()
+}
+
+/**
+ * Auth mode the registry should actually dial/Test with.
+ *
+ * Hermes Cloud authenticates through the portal session (embedded OAuth
+ * cookies) or a native RFC 8252 bearer keyed by gateway URL — never a pasted
+ * session token. A v2 `kind: cloud` row that still says `authMode: token`
+ * (the editor default before this coerce, or a hand-edited connections.json)
+ * is the macOS clean-install failure in #89529: global Cloud OAuth succeeds,
+ * then Test on the secondary source asks the user to paste a token.
+ *
+ * One-time WS tickets must not be copied into the token field to "fix" that.
+ */
+export function resolveRegistrySourceAuthMode(entry: {
+  authMode?: unknown
+  kind: ConnectionKind
+}): 'oauth' | 'token' {
+  if (entry.kind === 'cloud') {
+    return 'oauth'
+  }
+
+  return normAuthMode(entry.authMode)
+}
+
+/**
+ * Whether Test/dial of this source requires a decrypted persisted token.
+ * Local and SSH have their own credential paths; Cloud/OAuth use the session.
+ */
+export function registrySourceRequiresPersistedToken(entry: {
+  authMode?: unknown
+  kind: ConnectionKind
+}): boolean {
+  return entry.kind === 'remote' && resolveRegistrySourceAuthMode(entry) === 'token'
+}
+
+/** User-facing Test error, or null when the source can dial without a paste. */
+export function missingRegistrySessionTokenError(
+  entry: { authMode?: unknown; kind: ConnectionKind },
+  hasDecryptedToken: boolean
+): null | string {
+  if (!registrySourceRequiresPersistedToken(entry) || hasDecryptedToken) {
+    return null
+  }
+
+  return MISSING_REGISTRY_SESSION_TOKEN
+}
+
+/**
+ * After a successful Hermes Cloud login (v1 connection.json `mode: cloud`),
+ * make the v2 registry carry a matching `kind: cloud` / `authMode: oauth`
+ * source the Test button and secondary roster can actually use.
+ *
+ * - Matching remote/cloud URL is upgraded in place (token envelope dropped;
+ *   kind coerced to cloud; primary left unchanged).
+ * - A missing URL is appended as a secondary source — local stays primary.
+ * - Never writes a WS ticket or session token onto the entry.
+ */
+export function syncCloudOauthConnection(
+  registry: ConnectionRegistry,
+  input: { org?: unknown; url?: unknown }
+): ConnectionRegistry {
+  let url = ''
+
+  try {
+    url = normalizeRemoteBaseUrl(input.url)
+  } catch {
+    return registry
+  }
+
+  if (!url) {
+    return registry
+  }
+
+  const org = String(input.org || '').trim()
+  const key = gatewayUrlKey(url)
+
+  const existing = registry.connections.find(
+    connection =>
+      (connection.kind === 'remote' || connection.kind === 'cloud') && gatewayUrlKey(connection.url || '') === key
+  )
+
+  if (existing) {
+    const updated: RegistryConnection = {
+      ...existing,
+      authMode: 'oauth',
+      kind: 'cloud',
+      url
+    }
+
+    delete updated.token
+
+    if (org) {
+      updated.org = org
+    }
+
+    return upsertConnection(registry, updated)
+  }
+
+  const label = uniqueLabel(
+    hostLabelFromBaseUrl(url) || 'Hermes Cloud',
+    registry.connections.map(connection => connection.label)
+  )
+
+  const entry: RegistryConnection = {
+    authMode: 'oauth',
+    id: connectionIdForLabel(
+      label,
+      registry.connections.map(connection => connection.id)
+    ),
+    kind: 'cloud',
+    label,
+    url,
+    ...(org ? { org } : {})
+  }
+
+  return upsertConnection(registry, entry)
+}
+
 /** Mint a registry-unique id from a label (slug, then -2/-3… suffixes). */
 export function connectionIdForLabel(label: string, taken: Iterable<string>): string {
   const used = new Set([...taken])
@@ -579,19 +710,17 @@ export function normalizeConnectionInput(input: ConnectionInput, registry: Conne
     const url = normalizeRemoteBaseUrl(input.url)
 
     // Duplicate prevention: remote/cloud entries collide on the normalized URL
-    // (trimmed, trailing slashes stripped, lowercased) regardless of kind — a
-    // cloud entry and a remote entry pointing at the same gateway are dupes.
-    const urlKey = (value: string) => value.trim().replace(/\/+$/, '').toLowerCase()
-
+    // regardless of kind — a cloud entry and a remote entry pointing at the
+    // same gateway are dupes.
     const urlDupe = registry.connections.find(
-      c => (c.kind === 'remote' || c.kind === 'cloud') && c.id !== id && urlKey(c.url || '') === urlKey(url)
+      c => (c.kind === 'remote' || c.kind === 'cloud') && c.id !== id && gatewayUrlKey(c.url || '') === gatewayUrlKey(url)
     )
 
     if (urlDupe) {
       throw new Error(`A connection to this gateway URL already exists ("${urlDupe.label}").`)
     }
 
-    const authMode = normAuthMode(input.authMode)
+    const authMode = resolveRegistrySourceAuthMode({ authMode: input.authMode, kind })
     const entry: RegistryConnection = { id, kind, label, url, authMode }
 
     // A token is only meaningful for token-auth remotes. Dropping it here is
@@ -783,9 +912,11 @@ export function normalizeRegistry(raw: unknown): ConnectionRegistry {
       }
 
       clean.url = url
-      clean.authMode = normAuthMode(entry.authMode)
+      clean.authMode = resolveRegistrySourceAuthMode({ authMode: entry.authMode, kind })
 
-      if (entry.token !== undefined) {
+      // Cloud entries authenticate via the portal/native session. Keeping a
+      // leftover token envelope would make Test think this is paste-auth.
+      if (kind === 'remote' && clean.authMode === 'token' && entry.token !== undefined) {
         clean.token = entry.token
       }
 
@@ -870,10 +1001,10 @@ export function migrateV1ToRegistry(v1: unknown): ConnectionRegistry {
       kind,
       label,
       url,
-      authMode: normAuthMode(block.authMode)
+      authMode: resolveRegistrySourceAuthMode({ authMode: block.authMode, kind })
     }
 
-    if (block.token !== undefined) {
+    if (kind === 'remote' && entry.authMode === 'token' && block.token !== undefined) {
       entry.token = block.token
     }
 

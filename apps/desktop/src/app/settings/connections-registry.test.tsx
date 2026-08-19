@@ -101,6 +101,28 @@ describe('ConnectionsRegistrySection', () => {
     expect(screen.getByRole('button', { name: 'SSH' })).toBeTruthy()
   })
 
+  it('saves a new Hermes Cloud connection as oauth without a pasted token', async () => {
+    render(<ConnectionsRegistrySection />)
+
+    await waitFor(() => expect(screen.getByText('Homelab')).toBeTruthy())
+    fireEvent.click(screen.getByText('Add connection'))
+    fireEvent.click(screen.getByRole('button', { name: 'Hermes Cloud' }))
+    fireEvent.change(screen.getByPlaceholderText('Homelab'), { target: { value: 'Nous Cloud' } })
+    fireEvent.change(screen.getByPlaceholderText('http://homelab.lan:9119'), {
+      target: { value: 'https://agent.example.invalid' }
+    })
+    fireEvent.click(screen.getByText('Save connection').closest('button')!)
+
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(1))
+    expect(save.mock.calls[0][0]).toMatchObject({
+      authMode: 'oauth',
+      kind: 'cloud',
+      label: 'Nous Cloud',
+      url: 'https://agent.example.invalid'
+    })
+    expect(save.mock.calls[0][0].token).toBeUndefined()
+  })
+
   it('rejects a duplicate gateway URL in the save path with an inline error', async () => {
     render(<ConnectionsRegistrySection />)
 
