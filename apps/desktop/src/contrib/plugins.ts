@@ -13,11 +13,20 @@
  *    — the agent's/user's doors, watched + hot-reloaded by the runtime loader.
  */
 
-import { createPluginContext, type HermesPlugin } from './plugin'
+import { listBundledPluginExports } from './bundled-plugin-module'
+import { createPluginContext } from './plugin'
 import { pluginActive, publishPlugin } from './plugins-store'
 import { watchRuntimePlugins } from './runtime-loader'
 
-const modules = import.meta.glob<{ default: HermesPlugin }>('../plugins/*/plugin.{js,ts,tsx}', { eager: true })
+// Split by extension (no `{js,ts,tsx}` brace) and ask Vite for the default
+// export. Brace globs and `mod.default`-only reads have dropped the bundled
+// `.js` Bot Mode plugin from the inventory while leaving the `.tsx` Kanban
+// entry visible — including on Windows Desktop against a remote gateway.
+const modules = {
+  ...import.meta.glob('../plugins/*/plugin.js', { eager: true, import: 'default' }),
+  ...import.meta.glob('../plugins/*/plugin.ts', { eager: true, import: 'default' }),
+  ...import.meta.glob('../plugins/*/plugin.tsx', { eager: true, import: 'default' })
+}
 
 // One-shot init guard. Contributions themselves register by id (re-registering
 // is idempotent), but the disk-door watcher setup below (watchRuntimePlugins)
@@ -32,15 +41,16 @@ export function discoverBundledPlugins(): void {
 
   loaded = true
 
-  for (const [path, mod] of Object.entries(modules)) {
-    const plugin = mod.default
+  const discovered = listBundledPluginExports(modules)
+  const discoveredPaths = new Set(discovered.map(entry => entry.path))
 
-    if (!plugin?.id || typeof plugin.register !== 'function') {
+  for (const path of Object.keys(modules)) {
+    if (!discoveredPaths.has(path)) {
       console.warn(`[plugins] ${path} has no valid default HermesPlugin export — skipped`)
-
-      continue
     }
+  }
 
+  for (const { plugin } of discovered) {
     // Same inventory + live-toggle contract as runtime plugins: each bundled
     // plugin publishes a record with activate/deactivate handles, and a
     // persisted disable survives boots by skipping registration here.
